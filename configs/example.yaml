@@ -1,0 +1,18 @@
+# Experiment configuration.
+# Copy, edit, and record which config produced which results file.
+
+dataset: hai
+models:
+  - random          # always include: the point-adjust sanity check
+  - xgboost
+  - lstm_ae
+
+split:
+  train_frac: 0.60
+  val_frac: 0.20
+
+evaluation:
+  threshold_percentile: 97.0   # selected on validation, applied to test
+
+window_size: 60                # held constant across model families
+seed: 42

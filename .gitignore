@@ -1,0 +1,18 @@
+# Raw and processed data never enters version control.
+# iTrust terms restrict redistribution, and the files are large.
+data/raw/*
+data/processed/*
+!data/**/.gitkeep
+
+# Results are reproducible artefacts, but keep the summary tables
+results/*
+!results/.gitkeep
+!results/*.md
+
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+.DS_Store
+*.log
