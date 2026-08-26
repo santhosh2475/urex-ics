@@ -80,8 +80,19 @@ carries no information.
 The benchmark is only meaningful if neither family is quietly advantaged.
 
 - Both families train on the **same training window**. Boosting uses labels
-  (supervised); the autoencoder uses the normal rows only (unsupervised).
+  (supervised); the deep models use the normal rows only (unsupervised).
   Neither sees data the other could not have seen.
+- The deep family is represented by **two** detectors, and both are always
+  reported. `lstm_ae` scores by reconstruction and `lstm_forecast` scores by
+  one-step prediction error. This is not redundancy — see "The deep baseline
+  is two models" below. Reporting only the autoencoder would credit the
+  entire deep-learning family with a limitation of one scoring rule.
+- Sequence models window each **contiguous run** of normal training rows.
+  Masking the attack rows out and windowing the result splices non-adjacent
+  timesteps together and trains the model on transitions that never occur.
+  Enforced by `make_windows_segmented` in `data.py`.
+- Engineered lag features fill their NaN head with 0, never `bfill`.
+  Backfilling reaches forward in time and is a leak, however small.
 - Windowed and pointwise models produce score vectors of **identical
   length**, aligned to the same timeline via `unwindow_scores`, so both are
   evaluated against the same `y_true`.
@@ -89,6 +100,37 @@ The benchmark is only meaningful if neither family is quietly advantaged.
   confounded by different context lengths.
 - Missing-value handling is decided once per dataset and applied identically
   to all models.
+
+---
+
+## The deep baseline is two models
+
+The autoencoder scores a timestep by how well it can **reconstruct** it — but
+that timestep is part of the encoder's own input. The score therefore measures
+compressibility, not predictability, and that distinction decides what the
+model can detect at all.
+
+An attack that shifts a sensor's level is less compressible, and the
+autoencoder finds it. An attack that leaves the marginal distribution intact
+and only breaks the temporal correlation is invisible to it. For an AR(0.95)
+process, the last timestep's deviation from its window mean has variance
+0.904 under normal dynamics and 0.905 under an i.i.d. replacement — no gap for
+a reconstruction score to exploit. On `make_synthetic(temporal=True)` the
+autoencoder measures **ROC-AUC 0.38–0.46, below chance**, at every bottleneck
+size and training budget tried. Training it longer makes it worse.
+
+`lstm_forecast` scores the same windows on one-step prediction error, so the
+scored timestep is withheld from the input. On the same data it reaches
+**ROC-AUC ~0.97**. This is the Malhotra et al. (2016) / Hundman et al. (KDD
+2018) formulation and the standard deep baseline in the telemetry and ICS
+literature.
+
+The methodological point for the report: had the benchmark shipped only the
+autoencoder, it would have concluded "gradient boosting beats deep learning on
+temporally-defined attacks" — the project's headline claim — when the true
+cause was a scoring rule structurally blind to the anomalies in question. That
+is the same category of error as evaluating under point-adjust alone, and it
+gets the same treatment: report both, and treat the gap as a finding.
 
 ---
 
@@ -108,8 +150,9 @@ The benchmark is only meaningful if neither family is quietly advantaged.
 
 - [x] Evaluation harness, dual protocol, tested
 - [x] Chronological splitting with guardrails
-- [x] XGBoost detector, with optional lag features
-- [x] LSTM autoencoder detector
+- [x] XGBoost detector, with optional lag features (`xgboost`, `xgboost_lags`)
+- [x] LSTM autoencoder detector — reconstruction scoring, known blind spot
+- [x] LSTM forecaster detector — prediction scoring, sees temporal structure
 - [x] End-to-end smoke test on synthetic data
 - [ ] HAI loader
 - [ ] SWaT loader (awaiting iTrust)

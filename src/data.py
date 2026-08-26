@@ -20,6 +20,7 @@ Both are asserted, not merely documented.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,13 +53,24 @@ class Split:
         return self.X_train.shape[1]
 
     def normal_only(self) -> np.ndarray:
-        """Training rows labelled normal.
+        """Training rows labelled normal, as one array.
 
-        Unsupervised detectors (autoencoders) train on this. Supervised
+        Unsupervised detectors use the normal training rows. Supervised
         detectors (boosting) use X_train with y_train. Both draw from the
         SAME training window, so the comparison stays fair.
+
+        WARNING for sequence models: this concatenates non-adjacent rows.
+        Every removed attack segment becomes a splice where the timeline
+        jumps. Windows built across a splice contain a discontinuity that
+        never occurs in deployment, and a model trained to reconstruct them
+        is being taught an artefact. Sequence models should use
+        `normal_mask()` with `make_windows_segmented` instead.
         """
         return self.X_train[self.y_train == 0]
+
+    def normal_mask(self) -> np.ndarray:
+        """Boolean mask of normal training rows, positions preserved."""
+        return self.y_train == 0
 
     def summary(self) -> str:
         def rate(y):
@@ -169,6 +181,49 @@ def make_windows(
     return X_win, y_win
 
 
+def contiguous_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Return [start, end) index pairs for each contiguous run of True."""
+    mask = np.asarray(mask).astype(bool).ravel()
+    if mask.size == 0:
+        return []
+    padded = np.concatenate(([0], mask.astype(int), [0]))
+    diff = np.diff(padded)
+    starts = np.flatnonzero(diff == 1)
+    ends = np.flatnonzero(diff == -1)
+    return list(zip(starts.tolist(), ends.tolist()))
+
+
+def make_windows_segmented(
+    X: np.ndarray,
+    mask: np.ndarray,
+    window: int = 60,
+    stride: int = 1,
+) -> np.ndarray:
+    """
+    Window only the rows where `mask` is True, never spanning a gap.
+
+    Use this instead of `make_windows(X[mask])` whenever the mask removes
+    rows from the middle of a series. Masking first and windowing second
+    splices non-adjacent timesteps together and manufactures transitions
+    that do not exist in the data; windowing each contiguous run separately
+    keeps every window a genuine stretch of real time.
+
+    Runs shorter than `window` contribute nothing and are dropped.
+    """
+    parts = [
+        make_windows(X[start:end], window=window, stride=stride)
+        for start, end in contiguous_runs(mask)
+        if end - start >= window
+    ]
+    if not parts:
+        raise ValueError(
+            f"no contiguous run of masked rows reaches {window} timesteps; "
+            "either the window is too long for this dataset or the mask is "
+            "too fragmented to build sequences from"
+        )
+    return np.concatenate(parts)
+
+
 def unwindow_scores(
     scores: np.ndarray, n_original: int, window: int = 60, stride: int = 1
 ) -> np.ndarray:
@@ -196,13 +251,48 @@ def unwindow_scores(
 # (1 = anomaly) and all other columns numeric features. Do the messy,
 # dataset-specific cleaning HERE so nothing downstream needs special cases.
 
-def load_hai(version: str = "hai-21.03") -> pd.DataFrame:
-    """HAI. Files are semicolon-or-tab separated depending on version;
-    labels are in the `attack` column. Check the technical details PDF."""
-    raise NotImplementedError(
-        "Fill in once HAI is downloaded. Send Claude the column headers and "
-        "the first few rows of a label file."
-    )
+_HAI_WINDOW_RE = re.compile(
+    r"\[\s*\d+\]\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+"
+    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
+)
+
+
+def _parse_hai_attack_windows(label_path: Path) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Parse the '[ N]  start  end  duration' rows out of the HAI label
+    summary file. This particular HAI split ships attack windows as a
+    human-readable report, not a per-row label column."""
+    text = Path(label_path).read_text()
+    windows = [
+        (pd.Timestamp(m.group(1)), pd.Timestamp(m.group(2)))
+        for m in _HAI_WINDOW_RE.finditer(text)
+    ]
+    if not windows:
+        raise ValueError(f"no attack windows parsed from {label_path}")
+    return windows
+
+
+def load_hai(
+    data_path: Path | None = None,
+    label_path: Path | None = None,
+) -> pd.DataFrame:
+    """HAI, hai3 test split (2022-08-12 16:00 to 2022-08-13 07:00, 1 Hz).
+
+    `data_path` is a plain timestamp + sensor/actuator CSV with no label
+    column. `label_path` is a report listing attack windows as
+    [index] start_time end_time duration; a row is labelled 1 if its
+    timestamp falls inside any window (inclusive of both ends)."""
+    data_path = data_path or DATA_RAW / "hai" / "hai3_test_220812.csv"
+    label_path = label_path or DATA_RAW / "hai" / "hai3_test_220812_attack_windows.txt"
+
+    df = pd.read_csv(data_path, parse_dates=["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    label = np.zeros(len(df), dtype=int)
+    for start, end in _parse_hai_attack_windows(label_path):
+        label[(df["timestamp"] >= start) & (df["timestamp"] <= end)] = 1
+    df["label"] = label
+
+    return df.drop(columns=["timestamp"])
 
 
 def load_swat() -> pd.DataFrame:

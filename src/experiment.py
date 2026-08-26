@@ -89,11 +89,11 @@ def _save(results, dataset: str, tag: str) -> None:
 
 def _print_table(results) -> None:
     print()
-    print(f"{'model':<24} {'PR-AUC':>8} {'F1 pw':>8} {'F1 adj':>8} {'inflation':>10}")
-    print("-" * 62)
+    print(f"{'model':<26} {'PR-AUC':>8} {'F1 pw':>8} {'F1 adj':>8} {'inflation':>10}")
+    print("-" * 64)
     for r in results:
         print(
-            f"{r.meta.get('model', '?'):<24} {r.pr_auc:>8.3f} "
+            f"{r.meta.get('model', '?'):<26} {r.pr_auc:>8.3f} "
             f"{r.pointwise.f1:>8.3f} {r.point_adjusted.f1:>8.3f} "
             f"{r.f1_inflation:>+10.3f}"
         )
@@ -105,7 +105,12 @@ def _print_table(results) -> None:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default=None, help="registered dataset name")
-    ap.add_argument("--models", nargs="+", default=["random", "xgboost", "lstm_ae"])
+    ap.add_argument(
+        "--models",
+        nargs="+",
+        default=["random", "xgboost", "xgboost_lags", "lstm_ae", "lstm_forecast"],
+        help=f"any of: {', '.join(REGISTRY)}",
+    )
     ap.add_argument("--smoke", action="store_true",
                     help="run on synthetic data, no downloads needed")
     args = ap.parse_args()
