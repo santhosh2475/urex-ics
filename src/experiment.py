@@ -4,8 +4,8 @@ Experiment runner.
 One entry point for every result in the project, so that no number in the
 final report was produced by an ad-hoc notebook cell nobody can reproduce.
 
-    python src/experiment.py --smoke          # synthetic data, no downloads
-    python src/experiment.py --dataset hai --models xgboost lstm_ae random
+    python src/experiment.py                                  # swat, all models
+    python src/experiment.py --dataset swat --models xgboost lstm_ae random
 
 The threshold is chosen on VALIDATION and applied unchanged to TEST.
 Choosing it on test would be tuning on the test set.
@@ -20,7 +20,7 @@ from datetime import datetime
 import numpy as np
 
 from config import RESULTS, THRESHOLD_PERCENTILE
-from data import chronological_split, load, make_synthetic
+from data import load
 from evaluate import evaluate_all
 from models import REGISTRY
 
@@ -104,31 +104,15 @@ def _print_table(results) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default=None, help="registered dataset name")
+    ap.add_argument("--dataset", default="swat", help="registered dataset name")
     ap.add_argument(
         "--models",
         nargs="+",
         default=["random", "xgboost", "xgboost_lags", "lstm_ae", "lstm_forecast"],
         help=f"any of: {', '.join(REGISTRY)}",
     )
-    ap.add_argument("--smoke", action="store_true",
-                    help="run on synthetic data, no downloads needed")
     args = ap.parse_args()
 
-    if args.smoke:
-        # Two synthetic regimes: the project's central hypothesis in miniature.
-        for temporal in (False, True):
-            kind = "temporal" if temporal else "pointwise"
-            print("=" * 62)
-            print(f"SYNTHETIC, {kind} anomalies")
-            print("=" * 62)
-            df = make_synthetic(n=20000, n_features=12, temporal=temporal)
-            split = chronological_split(df, name=f"synthetic-{kind}")
-            run(split, args.models)
-        return
-
-    if not args.dataset:
-        ap.error("give --dataset or --smoke")
     run(load(args.dataset), args.models)
 
 

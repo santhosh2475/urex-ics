@@ -17,11 +17,8 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 python -m pytest tests/ -v          # should be all green
-python src/experiment.py --smoke    # end-to-end run on synthetic data
+python src/experiment.py            # runs SWaT through every registered model
 ```
-
-The smoke test needs no datasets. Run it first: if it works, the pipeline is
-sound and the only remaining unknown is the real data.
 
 ---
 
@@ -153,9 +150,8 @@ gets the same treatment: report both, and treat the gap as a finding.
 - [x] XGBoost detector, with optional lag features (`xgboost`, `xgboost_lags`)
 - [x] LSTM autoencoder detector — reconstruction scoring, known blind spot
 - [x] LSTM forecaster detector — prediction scoring, sees temporal structure
-- [x] End-to-end smoke test on synthetic data
-- [ ] HAI loader
-- [ ] SWaT loader (awaiting iTrust)
+- [x] HAI loader
+- [ ] SWaT loader (implemented, awaiting iTrust files to validate against)
 - [ ] WADI loader (awaiting iTrust)
 - [ ] Morris SCADA loader — the contrast case, load-bearing for the framework
 - [ ] Reproduce ESORICS 2022 autoencoder numbers on SWaT before claiming anything

@@ -295,11 +295,69 @@ def load_hai(
     return df.drop(columns=["timestamp"])
 
 
-def load_swat() -> pd.DataFrame:
-    """SWaT A1/A2 Dec 2015. Known quirks: column names carry trailing spaces,
-    the label column is `Normal/Attack` with string values, and the first
-    hours of the normal run are the plant stabilising and are usually dropped."""
-    raise NotImplementedError("Fill in once the iTrust download arrives.")
+def load_swat(
+    normal_path: Path | None = None,
+    attack_path: Path | None = None,
+    drop_stabilization_rows: int = 21_600,
+) -> pd.DataFrame:
+    """SWaT A1/A2 Dec 2015. iTrust ships this as two files: one week of
+    normal operation and two days of attacks, each with its own header row.
+
+    Known quirks, handled here so nothing downstream needs a special case:
+      - column names carry leading/trailing spaces (e.g. ` Timestamp`).
+      - the xlsx files have a blank title row; the real header is row 2.
+      - the label column `Normal/Attack` is "Normal" or "Attack", but the
+        shipped Attack file has rows with the typo "A ttack" -- compared
+        case-insensitively with spaces stripped, so anything not "normal"
+        counts as an attack.
+      - `drop_stabilization_rows` removes the start of the Normal run, which
+        is the plant stabilising rather than steady-state operation.
+        21,600 rows = 6 hours at 1 Hz, the convention used by most published
+        SWaT work; verify against the codebook once the real files are in
+        hand and pass a different value here if it disagrees.
+    """
+    normal_path = Path(normal_path or DATA_RAW / "swat" / "SWaT_Dataset_Normal_v1.xlsx")
+    attack_path = Path(attack_path or DATA_RAW / "swat" / "SWaT_Dataset_Attack_v0.xlsx")
+
+    def _read(path: Path) -> pd.DataFrame:
+        is_excel = path.suffix.lower() in (".xlsx", ".xls")
+        df = pd.read_excel(path, header=1) if is_excel else pd.read_csv(path)
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
+
+    normal = _read(normal_path).iloc[drop_stabilization_rows:]
+    attack = _read(attack_path)
+    df = pd.concat([normal, attack], ignore_index=True)
+
+    timestamp_col = next(c for c in df.columns if c.lower() == "timestamp")
+    try:
+        # iTrust's usual format, e.g. "22/12/2015 4:30:00 PM". Explicit
+        # format is much faster than inference over ~450k rows.
+        df[timestamp_col] = pd.to_datetime(
+            df[timestamp_col], format="%d/%m/%Y %I:%M:%S %p"
+        )
+    except ValueError:
+        df[timestamp_col] = pd.to_datetime(df[timestamp_col], dayfirst=True)
+    df = df.sort_values(timestamp_col).reset_index(drop=True)
+
+    label_col = next(c for c in df.columns if c.lower() == "normal/attack")
+    label = (
+        df[label_col].astype(str).str.strip().str.lower().str.replace(" ", "", regex=False)
+    )
+    df["label"] = (label != "normal").astype(int)
+    df = df.drop(columns=[timestamp_col, label_col])
+
+    feature_cols = [c for c in df.columns if c != "label"]
+    for col in feature_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    bad = [c for c in feature_cols if df[c].isna().any()]
+    if bad:
+        raise ValueError(
+            f"non-numeric values found in SWaT feature columns after cleaning: {bad}. "
+            "iTrust's SWaT physical data should be fully numeric -- inspect the raw file."
+        )
+
+    return df
 
 
 def load_wadi() -> pd.DataFrame:
