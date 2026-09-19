@@ -9,6 +9,12 @@ results/*
 !results/.gitkeep
 !results/*.md
 
+# swat-preprocess is vendored EDA tooling; its data/fig outputs are derived
+# from the same iTrust-restricted SWaT files and are regenerated locally.
+swat-preprocess/data/*
+!swat-preprocess/data/README.md
+swat-preprocess/fig/*
+
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/

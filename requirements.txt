@@ -10,3 +10,4 @@ matplotlib>=3.8
 pyyaml>=6.0
 tqdm>=4.66
 openpyxl>=3.1
+statsmodels>=0.14

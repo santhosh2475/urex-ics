@@ -1,6 +1,31 @@
 # 📊 iTrust SWaT Dataset Preprocess Tool
 
-This is a tool for iTrust SWaT dataset preprocessing, including dataset details introduction, dataset visulization, dataset processing and some pytorch utils. 
+This is a tool for iTrust SWaT dataset preprocessing, including dataset details introduction, dataset visulization, dataset processing and some pytorch utils.
+
+> **Status in this repo:** vendored, standalone EDA/visualizer tooling (see
+> `data/README.md` for how `data/` is populated here). It is separate from
+> `src/data.py`'s `load_swat()`, which is what the actual experiment
+> pipeline trains and evaluates on — nothing here feeds back into that
+> pipeline. Two deviations from upstream, made so this runs against the
+> real 2015 attack data rather than a hand-transcribed subset:
+> - `notebook/swat-2015-info.ipynb` derives attack windows straight from
+>   the dataset's own `Normal/Attack` column instead of a manually
+>   typed-in list for one day, so it shades every real attack window
+>   (all 51 sensors, since the row label alone doesn't say which sensor
+>   was targeted) rather than one hand-picked sensor per window.
+> - The 51-panel plots (`fig/swat-2015.png`, `fig/swat-2015-sr.png`) are
+>   built at 60x100in / 6000x10000px, saved via `plt.savefig()` and
+>   explicitly `plt.show()`-n — open the PNG directly if a notebook
+>   viewer doesn't render an embedded image that large.
+>
+> **Reading the plots:** the real data covers `2015-12-28 10:00:00` →
+> `2016-01-02 14:59:59` (449,919 rows, one per second, essentially
+> gapless). Every plot here only shows a single 24-hour slice of that —
+> `29 Dec 2015` by default, set by `time_start`/`time_end` in each
+> notebook — not the full ~5-day range; change those two lines to look
+> at a different day. Each row in the figure is one sensor/actuator; the
+> shaded red bands are real attack windows (from the `Normal/Attack`
+> column) that fall inside the plotted day.
 
 ## 💡 Introduction
 
