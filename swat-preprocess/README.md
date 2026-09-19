@@ -78,40 +78,6 @@ Python Packages: jupyterlab, torch, numpy, pandas, matplotlib, sklearn
 - `script/`: preprocess in script format
 - `src/`: source code of tools 
 
-## 📖 How to start
-
-**Step 0.** Before everything, please follow the `data/README.md` to get the dataset file. This may take one or two days. 
-
-**Step 1.** [Clone]() or [Download]() this repository.
-
-**Step 2.** Check `notebook/swat-2015-info.ipynb` to get a basic idea about the dataset. More details are included in the notebook. 
-
-**Step 3.** Check `notebook/swat-2015-process.ipynb` to preprocess the dataset, including normalization, format transformation, spectral residual, simple anomaly detection, etc. More details are included in the notebook. 
-
-**Step 4.** Check `notebook/swat-2015-dataset.ipynb` to check generated torch dataset. More details are included in the notebook. You can also use the `src/swatset.py` to do that. 
-
-**Step 5.** Freely use scrpts in your projects! 
-
-## 📋 Examples
-
-**1.** Visulization for the original dataset (here shows part of, P1 & P2). Orange lines mean anomaly part. 
-
-![Visulization for the original dataset](fig/swat-2015-original.png)
-
-
-
-**2.** Visulization for the original datset (P4 & P5). Orange lines mean attacks. 
-
-![Original Dataset](fig/swat-2015-original2.png)
-
-**2.** Spectral on one feature as an example. The upper one is the feature data before processing, the down one is value after SR processing. It's much easier to show the attack. 
-
-![SR Sample](fig/swat-2015-sr-sample2.png)
-
-**3.** Spectral on all dataset features. To check the performance, we can compare this fiture with the original data. 
-
-![SR](fig/swat-2015-sr3.png)
-
 ## 📚 References
 
 [1]. Hou, Xiaodi, and Liqing Zhang. **"Saliency detection: A spectral residual approach."** *2007 IEEE Conference on computer vision and pattern recognition.* Ieee, 2007.
