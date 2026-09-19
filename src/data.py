@@ -316,7 +316,7 @@ def load_swat(
         SWaT work; verify against the codebook once the real files are in
         hand and pass a different value here if it disagrees.
     """
-    normal_path = Path(normal_path or DATA_RAW / "swat" / "SWaT_Dataset_Normal_v1.xlsx")
+    normal_path = Path(normal_path or DATA_RAW / "swat" / "SWaT_Dataset_Normal_v0.xlsx")
     attack_path = Path(attack_path or DATA_RAW / "swat" / "SWaT_Dataset_Attack_v0.xlsx")
 
     def _read(path: Path) -> pd.DataFrame:
@@ -330,6 +330,7 @@ def load_swat(
     df = pd.concat([normal, attack], ignore_index=True)
 
     timestamp_col = next(c for c in df.columns if c.lower() == "timestamp")
+    df[timestamp_col] = df[timestamp_col].astype(str).str.strip()
     try:
         # iTrust's usual format, e.g. "22/12/2015 4:30:00 PM". Explicit
         # format is much faster than inference over ~450k rows.

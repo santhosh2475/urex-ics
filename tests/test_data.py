@@ -15,7 +15,7 @@ import pytest
 from config import DATA_RAW
 from data import chronological_split, load_swat
 
-_NORMAL = DATA_RAW / "swat" / "SWaT_Dataset_Normal_v1.xlsx"
+_NORMAL = DATA_RAW / "swat" / "SWaT_Dataset_Normal_v0.xlsx"
 _ATTACK = DATA_RAW / "swat" / "SWaT_Dataset_Attack_v0.xlsx"
 
 pytestmark = pytest.mark.skipif(
