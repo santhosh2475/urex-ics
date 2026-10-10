@@ -2,12 +2,12 @@
 
 This is a tool for iTrust SWaT dataset preprocessing, including dataset details introduction, dataset visulization, dataset processing and some pytorch utils.
 
-> **Status in this repo:** vendored, standalone EDA/visualizer tooling (see
+> **Status in this repo:** standalone EDA/visualizer code (see
 > `data/README.md` for how `data/` is populated here). It is separate from
 > `src/data.py`'s `load_swat()`, which is what the actual experiment
 > pipeline trains and evaluates on — nothing here feeds back into that
-> pipeline. Two deviations from upstream, made so this runs against the
-> real 2015 attack data rather than a hand-transcribed subset:
+> pipeline. Two deviations made so this runs against the real 2015 attack
+> data rather than a hand-transcribed subset:
 > - `notebook/swat-2015-info.ipynb` derives attack windows straight from
 >   the dataset's own `Normal/Attack` column instead of a manually
 >   typed-in list for one day, so it shades every real attack window
