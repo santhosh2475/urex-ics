@@ -1,13 +1,13 @@
+# src/ pipeline (data.py, models.py, evaluate.py, experiment.py, tune.py,
+# compare_models.py)
 numpy>=1.26
 pandas>=2.0
 scikit-learn>=1.4
-scipy>=1.11
 xgboost>=2.0
-lightgbm>=4.0
-catboost>=1.2
 torch>=2.0
 matplotlib>=3.8
-pyyaml>=6.0
-tqdm>=4.66
-openpyxl>=3.1
+openpyxl>=3.1          # pandas' .xlsx engine; never imported by name directly
+
+# swat-preprocess/ only (the vendored EDA notebooks)
+scipy>=1.11
 statsmodels>=0.14
