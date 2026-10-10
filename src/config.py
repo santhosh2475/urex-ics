@@ -49,12 +49,6 @@ WINDOW_SIZE = 60  # 60 seconds at 1 Hz sampling
 # axis. It is a PRIOR to be tested empirically in the EDA, not a finding.
 
 DATASET_INFO = {
-    "hai": {
-        "source": "NSR / ETRI, South Korea",
-        "domain": "power generation (turbine + boiler + water treatment via HIL)",
-        "temporal_dependency": "high",
-        "role": "primary, cross-domain replication",
-    },
     "swat": {
         "source": "iTrust, SUTD",
         "domain": "water treatment",

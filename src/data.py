@@ -20,7 +20,6 @@ Both are asserted, not merely documented.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -88,6 +87,39 @@ class Split:
 # splitting and scaling
 # --------------------------------------------------------------------------
 
+def _episode_safe_cut(y: np.ndarray, target: int, after: int = 0) -> int:
+    """
+    Nudge a target split index forward so it never lands inside a
+    contiguous attack episode.
+
+    A plain `int(n * frac)` cut doesn't know where the attacks are, so it
+    can bisect one -- half its rows end up in the earlier split, half in
+    the later one, as an accident of arithmetic rather than a decision.
+    This snaps such a target FORWARD to that episode's end, never
+    backward: the earlier split (chronologically first) gets the whole
+    episode, rather than leaving a truncated, label-inconsistent fragment
+    dangling at the start of the later one. Consistently snapping the same
+    direction is also what makes the result deterministic and easy to
+    reason about, rather than picking whichever side is numerically
+    closer.
+
+    One concrete consequence worth knowing about: an unusually long
+    episode sitting near a target cut gets pulled wholly into the split
+    that already contains it rather than split, which can push that split
+    noticeably larger than its nominal fraction. That's intentional --
+    it's strictly better than the alternative of bisecting a real attack
+    and reporting an inconsistent label for it on both sides.
+
+    `after` stops the result from landing before an earlier cut (needed
+    when computing the val/test boundary once train/val is already fixed).
+    """
+    target = max(target, after)
+    for start, end in contiguous_runs(y.astype(bool)):
+        if start <= target < end:
+            return max(end, after)
+    return target
+
+
 def chronological_split(
     df: pd.DataFrame,
     label_col: str = "label",
@@ -97,7 +129,15 @@ def chronological_split(
     scale: bool = True,
 ) -> Split:
     """
-    Split a time-ordered dataframe into train/val/test by position.
+    Split a time-ordered dataframe into train/val/test by position --
+    nudged, when necessary, so neither boundary bisects an attack episode
+    (see `_episode_safe_cut`). train_frac/val_frac are therefore TARGETS,
+    not guarantees: an episode that straddles a target cut shifts that
+    boundary forward to the episode's end, so the realised split sizes can
+    differ from the nominal fractions. The alternative -- cutting through
+    an episode and splitting its rows across two sets with no regard for
+    where the attack actually was -- is worse, and was previously silent:
+    nothing recorded whether a boundary happened to land mid-attack.
 
     `df` MUST already be sorted by time. Feature columns are everything except
     `label_col`; drop timestamps and other non-features before calling.
@@ -111,8 +151,8 @@ def chronological_split(
     X = features.to_numpy(dtype=float)
 
     n = len(df)
-    i_train = int(n * train_frac)
-    i_val = int(n * (train_frac + val_frac))
+    i_train = _episode_safe_cut(y, int(n * train_frac))
+    i_val = _episode_safe_cut(y, int(n * (train_frac + val_frac)), after=i_train)
 
     X_train, X_val, X_test = X[:i_train], X[i_train:i_val], X[i_val:]
     y_train, y_val, y_test = y[:i_train], y[i_train:i_val], y[i_val:]
@@ -251,50 +291,6 @@ def unwindow_scores(
 # (1 = anomaly) and all other columns numeric features. Do the messy,
 # dataset-specific cleaning HERE so nothing downstream needs special cases.
 
-_HAI_WINDOW_RE = re.compile(
-    r"\[\s*\d+\]\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+"
-    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
-)
-
-
-def _parse_hai_attack_windows(label_path: Path) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
-    """Parse the '[ N]  start  end  duration' rows out of the HAI label
-    summary file. This particular HAI split ships attack windows as a
-    human-readable report, not a per-row label column."""
-    text = Path(label_path).read_text()
-    windows = [
-        (pd.Timestamp(m.group(1)), pd.Timestamp(m.group(2)))
-        for m in _HAI_WINDOW_RE.finditer(text)
-    ]
-    if not windows:
-        raise ValueError(f"no attack windows parsed from {label_path}")
-    return windows
-
-
-def load_hai(
-    data_path: Path | None = None,
-    label_path: Path | None = None,
-) -> pd.DataFrame:
-    """HAI, hai3 test split (2022-08-12 16:00 to 2022-08-13 07:00, 1 Hz).
-
-    `data_path` is a plain timestamp + sensor/actuator CSV with no label
-    column. `label_path` is a report listing attack windows as
-    [index] start_time end_time duration; a row is labelled 1 if its
-    timestamp falls inside any window (inclusive of both ends)."""
-    data_path = data_path or DATA_RAW / "hai" / "hai3_test_220812.csv"
-    label_path = label_path or DATA_RAW / "hai" / "hai3_test_220812_attack_windows.txt"
-
-    df = pd.read_csv(data_path, parse_dates=["timestamp"])
-    df = df.sort_values("timestamp").reset_index(drop=True)
-
-    label = np.zeros(len(df), dtype=int)
-    for start, end in _parse_hai_attack_windows(label_path):
-        label[(df["timestamp"] >= start) & (df["timestamp"] <= end)] = 1
-    df["label"] = label
-
-    return df.drop(columns=["timestamp"])
-
-
 def load_swat(
     normal_path: Path | None = None,
     attack_path: Path | None = None,
@@ -379,7 +375,6 @@ def load_batadal() -> pd.DataFrame:
 
 
 LOADERS = {
-    "hai": load_hai,
     "swat": load_swat,
     "wadi": load_wadi,
     "morris": load_morris,

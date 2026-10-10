@@ -150,8 +150,7 @@ gets the same treatment: report both, and treat the gap as a finding.
 - [x] XGBoost detector, with optional lag features (`xgboost`, `xgboost_lags`)
 - [x] LSTM autoencoder detector — reconstruction scoring, known blind spot
 - [x] LSTM forecaster detector — prediction scoring, sees temporal structure
-- [x] HAI loader
-- [ ] SWaT loader (implemented, awaiting iTrust files to validate against)
+- [x] SWaT loader, validated against the real iTrust download
 - [ ] WADI loader (awaiting iTrust)
 - [ ] Morris SCADA loader — the contrast case, load-bearing for the framework
 - [ ] Reproduce ESORICS 2022 autoencoder numbers on SWaT before claiming anything
@@ -162,8 +161,5 @@ gets the same treatment: report both, and treat the gap as a finding.
 
 The SWaT, WADI, and BATADAL datasets were provided by iTrust, Centre for
 Research in Cyber Security, Singapore University of Technology and Design.
-
-HAI: Shin, Lee, Yun and Kim, *HAI 1.0: HIL-based Augmented ICS Security
-Dataset*, USENIX CSET 2020.
 
 See `notes/datasets.md` for full terms and the selection rationale.
