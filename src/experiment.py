@@ -9,6 +9,16 @@ final report was produced by an ad-hoc notebook cell nobody can reproduce.
 
 The threshold is chosen on VALIDATION and applied unchanged to TEST.
 Choosing it on test would be tuning on the test set.
+
+The percentile is taken over validation's NORMAL-labelled rows only, not
+every row in validation. A percentile taken over a validation window that
+is itself partly attacks (SWaT's is 22.95% attack) sits artificially high
+-- "the top 3% most unusual score, including a quarter of rows that are
+genuinely unusual" is a different, stricter number than "the top 3% most
+unusual score among known-normal operation," which is the actual question
+a deployment threshold is supposed to answer. Using every row silently
+conflated the two and was plausibly why so many models landed at test
+F1 = 0.000 this session.
 """
 
 from __future__ import annotations
@@ -31,7 +41,19 @@ def run_one(split, detector, threshold_percentile: float = THRESHOLD_PERCENTILE)
     detector.fit(split)
 
     val_scores = detector.score(split.X_val)
-    threshold = float(np.percentile(val_scores, threshold_percentile))
+    normal_mask = split.y_val == 0
+    if normal_mask.any():
+        threshold = float(np.percentile(val_scores[normal_mask], threshold_percentile))
+    else:
+        # No known-normal rows in validation at all -- can't calibrate
+        # against "normal" the way this is meant to work. Fall back to all
+        # of validation rather than crash, but say so loudly: this is a
+        # degenerate split, not a case this protocol was designed for.
+        print(
+            f"    NOTE {detector.name}: validation split has no normal rows; "
+            "falling back to a threshold over all of validation."
+        )
+        threshold = float(np.percentile(val_scores, threshold_percentile))
 
     test_scores = detector.score(split.X_test)
     result = evaluate_all(
