@@ -477,42 +477,70 @@ class LSTMAutoencoderDetector(Detector):
     def __init__(
         self,
         window: int = WINDOW_SIZE,
-        hidden: int = 64,
+        hidden1: int = 128,
+        hidden2: int = 64,
         epochs: int = 8,
         batch_size: int = 256,
         lr: float = 1e-3,
         device: str | None = None,
     ):
         self.window = window
-        self.hidden = hidden
+        self.hidden1 = hidden1  # outer LSTM width (encoder in / decoder out)
+        self.hidden2 = hidden2  # latent width (the bottleneck both sides share)
         self.epochs = epochs
         self.batch_size = batch_size
         self.lr = lr
         self.device = device
-        self.name = f"lstm_ae(w={window},h={hidden})"
+        self.name = f"lstm_ae(w={window},h={hidden1}-{hidden2})"
         self.model = None
+        self.loss_history: list[float] = []  # one average loss per epoch, for plotting
 
     def _build(self, n_features: int):
         import torch
         import torch.nn as nn
 
         class LSTMAE(nn.Module):
-            def __init__(self, n_features, hidden, window):
+            """
+            Encoder: LSTM(128) -> LSTM(64), the second collapses to one
+            vector per window (the latent/bottleneck). Decoder: that vector
+            repeated across the window -> LSTM(64) -> LSTM(128) -> a Linear
+            applied at every timestep (PyTorch has no TimeDistributed
+            wrapper; Linear already broadcasts over the time dimension of a
+            [batch, time, features] tensor, which is the same operation).
+
+            PyTorch's nn.LSTM always uses tanh for its internal gates (it's
+            fixed in the cuDNN kernel, unlike Keras where `activation=`
+            is a free parameter) -- so the ReLU from the reference
+            architecture is applied explicitly to each LSTM layer's output
+            here instead, which is the standard way this Keras pattern gets
+            ported to PyTorch.
+            """
+
+            def __init__(self, n_features, h1, h2, window):
                 super().__init__()
                 self.window = window
-                self.encoder = nn.LSTM(n_features, hidden, batch_first=True)
-                self.decoder = nn.LSTM(hidden, hidden, batch_first=True)
-                self.out = nn.Linear(hidden, n_features)
+                self.enc1 = nn.LSTM(n_features, h1, batch_first=True)
+                self.enc2 = nn.LSTM(h1, h2, batch_first=True)
+                self.dec1 = nn.LSTM(h2, h2, batch_first=True)
+                self.dec2 = nn.LSTM(h2, h1, batch_first=True)
+                self.relu = nn.ReLU()
+                self.out = nn.Linear(h1, n_features)
 
             def forward(self, x):
-                _, (h, _) = self.encoder(x)
-                # repeat the final hidden state across the window
-                z = h[-1].unsqueeze(1).repeat(1, self.window, 1)
-                d, _ = self.decoder(z)
-                return self.out(d)
+                e1, _ = self.enc1(x)
+                e1 = self.relu(e1)
+                _, (h, _) = self.enc2(e1)
+                z = self.relu(h[-1])  # latent vector, one per window
+
+                z = z.unsqueeze(1).repeat(1, self.window, 1)
+                d1, _ = self.dec1(z)
+                d1 = self.relu(d1)
+                d2, _ = self.dec2(d1)
+                d2 = self.relu(d2)
+                return self.out(d2)
 
         torch.manual_seed(SEED)
-        return LSTMAE(n_features, self.hidden, self.window)
+        return LSTMAE(n_features, self.hidden1, self.hidden2, self.window)
 
     def fit(self, split: Split) -> "LSTMAutoencoderDetector":
         import torch
@@ -548,7 +576,9 @@ class LSTMAutoencoderDetector(Detector):
                 loss.backward()
                 opt.step()
                 total += loss.item() * len(batch)
-            print(f"    epoch {epoch:>3}  loss {total / len(X_win):.5f}")
+            epoch_loss = total / len(X_win)
+            self.loss_history.append(epoch_loss)
+            print(f"    epoch {epoch:>3}  loss {epoch_loss:.5f}")
         return self
 
     def score(self, X: np.ndarray) -> np.ndarray:
@@ -628,6 +658,7 @@ class LSTMForecastDetector(Detector):
         self.device = device
         self.name = f"lstm_forecast(w={window},h={hidden})"
         self.model = None
+        self.loss_history: list[float] = []
 
     def _build(self, n_features: int):
         import torch
@@ -681,7 +712,9 @@ class LSTMForecastDetector(Detector):
                 loss.backward()
                 opt.step()
                 total += loss.item() * len(batch)
-            print(f"    epoch {epoch:>3}  loss {total / len(X_win):.5f}")
+            epoch_loss = total / len(X_win)
+            self.loss_history.append(epoch_loss)
+            print(f"    epoch {epoch:>3}  loss {epoch_loss:.5f}")
         return self
 
     def score(self, X: np.ndarray) -> np.ndarray:
@@ -760,6 +793,7 @@ class CNNClassifierDetector(Detector):
         self.device = device
         self.name = f"cnn_classifier(w={window},f={filters})"
         self.model = None
+        self.loss_history: list[float] = []
 
     def _build(self, n_features: int):
         import torch
@@ -847,7 +881,9 @@ class CNNClassifierDetector(Detector):
                 loss.backward()
                 opt.step()
                 total += loss.item() * len(xb)
-            print(f"    epoch {epoch:>3}  loss {total / len(X_win):.5f}")
+            epoch_loss = total / len(X_win)
+            self.loss_history.append(epoch_loss)
+            print(f"    epoch {epoch:>3}  loss {epoch_loss:.5f}")
         return self
 
     def score(self, X: np.ndarray) -> np.ndarray:

@@ -35,9 +35,14 @@ from evaluate import evaluate_all
 from models import REGISTRY
 
 
-def run_one(split, detector, threshold_percentile: float = THRESHOLD_PERCENTILE):
-    """Fit one detector on one split and evaluate it on the test window."""
-    print(f"  {detector.name} ...")
+def fit_and_score(split, detector, threshold_percentile: float = THRESHOLD_PERCENTILE):
+    """
+    Fit one detector, calibrate its threshold on validation, score test.
+
+    Returns (threshold, test_scores) -- the raw score array, for callers
+    that need it directly (diagnostic plots in visualize.py / notebooks).
+    run_one() below wraps this to produce a full metrics Result instead.
+    """
     detector.fit(split)
 
     val_scores = detector.score(split.X_val)
@@ -56,6 +61,13 @@ def run_one(split, detector, threshold_percentile: float = THRESHOLD_PERCENTILE)
         threshold = float(np.percentile(val_scores, threshold_percentile))
 
     test_scores = detector.score(split.X_test)
+    return threshold, test_scores
+
+
+def run_one(split, detector, threshold_percentile: float = THRESHOLD_PERCENTILE):
+    """Fit one detector on one split and evaluate it on the test window."""
+    print(f"  {detector.name} ...")
+    threshold, test_scores = fit_and_score(split, detector, threshold_percentile)
     result = evaluate_all(
         split.y_test,
         test_scores,
