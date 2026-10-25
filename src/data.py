@@ -20,8 +20,7 @@ Both are asserted, not merely documented.
 
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -47,10 +46,30 @@ class Split:
     y_test: np.ndarray
     feature_names: list[str]
     name: str
+    # [start, end) bounds of each contiguous stretch of real time inside
+    # each part. A chronological split has one block per part; the
+    # stratified split concatenates several non-adjacent blocks, and every
+    # windowed model must window within a block, never across the join.
+    # None means one block spanning the whole part.
+    blocks: dict[str, list[tuple[int, int]]] | None = field(default=None)
 
     @property
     def n_features(self) -> int:
         return self.X_train.shape[1]
+
+    def bounds(self, part: str) -> list[tuple[int, int]]:
+        """Block bounds within `part` ('train', 'val' or 'test')."""
+        if self.blocks and part in self.blocks:
+            return self.blocks[part]
+        return [(0, len(getattr(self, f"y_{part}")))]
+
+    def continuity_mask(self, part: str) -> np.ndarray:
+        """True everywhere except the first row of every block after the
+        first, so `contiguous_runs` of (mask & this) never spans a join."""
+        mask = np.ones(len(getattr(self, f"y_{part}")), dtype=bool)
+        for start, _ in self.bounds(part)[1:]:
+            mask[start] = False
+        return mask
 
     def normal_only(self) -> np.ndarray:
         """Training rows labelled normal, as one array.
@@ -88,6 +107,39 @@ class Split:
 # splitting and scaling
 # --------------------------------------------------------------------------
 
+def _episode_safe_cut(y: np.ndarray, target: int, after: int = 0) -> int:
+    """
+    Nudge a target split index forward so it never lands inside a
+    contiguous attack episode.
+
+    A plain `int(n * frac)` cut doesn't know where the attacks are, so it
+    can bisect one -- half its rows end up in the earlier split, half in
+    the later one, as an accident of arithmetic rather than a decision.
+    This snaps such a target FORWARD to that episode's end, never
+    backward: the earlier split (chronologically first) gets the whole
+    episode, rather than leaving a truncated, label-inconsistent fragment
+    dangling at the start of the later one. Consistently snapping the same
+    direction is also what makes the result deterministic and easy to
+    reason about, rather than picking whichever side is numerically
+    closer.
+
+    One concrete consequence worth knowing about: an unusually long
+    episode sitting near a target cut gets pulled wholly into the split
+    that already contains it rather than split, which can push that split
+    noticeably larger than its nominal fraction. That's intentional --
+    it's strictly better than the alternative of bisecting a real attack
+    and reporting an inconsistent label for it on both sides.
+
+    `after` stops the result from landing before an earlier cut (needed
+    when computing the val/test boundary once train/val is already fixed).
+    """
+    target = max(target, after)
+    for start, end in contiguous_runs(y.astype(bool)):
+        if start <= target < end:
+            return max(end, after)
+    return target
+
+
 def chronological_split(
     df: pd.DataFrame,
     label_col: str = "label",
@@ -97,7 +149,15 @@ def chronological_split(
     scale: bool = True,
 ) -> Split:
     """
-    Split a time-ordered dataframe into train/val/test by position.
+    Split a time-ordered dataframe into train/val/test by position --
+    nudged, when necessary, so neither boundary bisects an attack episode
+    (see `_episode_safe_cut`). train_frac/val_frac are therefore TARGETS,
+    not guarantees: an episode that straddles a target cut shifts that
+    boundary forward to the episode's end, so the realised split sizes can
+    differ from the nominal fractions. The alternative -- cutting through
+    an episode and splitting its rows across two sets with no regard for
+    where the attack actually was -- is worse, and was previously silent:
+    nothing recorded whether a boundary happened to land mid-attack.
 
     `df` MUST already be sorted by time. Feature columns are everything except
     `label_col`; drop timestamps and other non-features before calling.
@@ -111,8 +171,8 @@ def chronological_split(
     X = features.to_numpy(dtype=float)
 
     n = len(df)
-    i_train = int(n * train_frac)
-    i_val = int(n * (train_frac + val_frac))
+    i_train = _episode_safe_cut(y, int(n * train_frac))
+    i_val = _episode_safe_cut(y, int(n * (train_frac + val_frac)), after=i_train)
 
     X_train, X_val, X_test = X[:i_train], X[i_train:i_val], X[i_val:]
     y_train, y_val, y_test = y[:i_train], y[i_train:i_val], y[i_val:]
@@ -128,6 +188,303 @@ def chronological_split(
     )
     _assert_split_valid(split, n)
     return split
+
+
+# --------------------------------------------------------------------------
+# episode-stratified split
+# --------------------------------------------------------------------------
+# The chronological split above is the deployment-realistic protocol, but on
+# SWaT it hands each part a very different set of attacks: one 35,900-second
+# episode (about 10 hours, stage 5) lands in validation alone and makes up
+# 78% of all attack rows, train sees 9 short attacks and no stage-4 attack at
+# all, and the three parts end up at 0.93% / 22.95% / 3.76% attack rate.
+# Supervised models are then evaluated on attack types they never saw, and
+# no threshold chosen on validation transfers to test.
+#
+# `stratified_episode_split` is the attack-coverage protocol. Ordinary
+# stratified k-fold is NOT an option on time series -- shuffling single rows
+# puts second t in train and second t+1 in test, which is a leak. Instead:
+#
+#   1. Attack episodes closer together than `merge_gap` seconds are grouped
+#      into one incident, so related attacks never straddle two parts.
+#   2. The timeline is cut at the midpoint of every gap between incidents,
+#      giving blocks of [normal lead-in, incident, normal tail-off].
+#   3. The attack-free prefix (SWaT's whole normal week) always goes to
+#      train, so the unsupervised models keep their full normal history.
+#   4. Incident blocks are assigned to train/val/test stratified by the
+#      stage they target and balanced on attack-row counts.
+#   5. `purge` rows either side of every boundary between two different
+#      parts are dropped, so no window, lag or rolling feature built inside
+#      one part can reach into a neighbouring block of another part.
+#
+# Rows keep their time order within each part, the scaler is still fit on
+# train only, and blocks are recorded on the Split so windowed models never
+# window across a join. Report this protocol ALONGSIDE the chronological
+# one, never instead of it: chronological answers "how would this behave if
+# deployed on day 1", stratified answers "how well does it detect each kind
+# of attack when it has seen examples of that kind".
+
+def attack_incidents(
+    y: np.ndarray,
+    X: pd.DataFrame | None = None,
+    merge_gap: int = 1200,
+    context: int = 1800,
+) -> pd.DataFrame:
+    """
+    One row per attack incident (episodes closer than `merge_gap` merged).
+
+    If `X` (unscaled feature frame aligned with `y`) is given, each incident
+    is also tagged with the process stage it most likely targets: the stage
+    digit of the sensor whose mean moved the most, in standard deviations of
+    the `context` rows of normal operation just before it. iTrust's own
+    attack list would be the authoritative source; this is the data-driven
+    stand-in, and for SWaT it recovers the stage of the documented attack
+    points in most cases.
+    """
+    episodes = contiguous_runs(np.asarray(y).astype(bool))
+    if not episodes:
+        raise ValueError("no attack rows in y")
+
+    groups = [[episodes[0]]]
+    for s, e in episodes[1:]:
+        if s - groups[-1][-1][1] < merge_gap:
+            groups[-1].append((s, e))
+        else:
+            groups.append([(s, e)])
+
+    sd = None
+    if X is not None:
+        first = episodes[0][0]
+        sd = X.iloc[:first].std().replace(0, np.nan)
+
+    rows = []
+    for k, g in enumerate(groups):
+        start, end = g[0][0], g[-1][1]
+        row = {
+            "incident": k,
+            "start": start,
+            "end": end,
+            "n_episodes": len(g),
+            "attack_rows": int(sum(e - s for s, e in g)),
+        }
+        if X is not None:
+            # stage of the longest episode in the incident
+            s, e = max(g, key=lambda se: se[1] - se[0])
+            pre = X.iloc[max(0, s - context) : s]
+            shift = ((X.iloc[s:e].mean() - pre.mean()).abs() / sd).fillna(0)
+            top = shift.idxmax()
+            digit = next((ch for ch in top if ch.isdigit()), "?")
+            row["stage"] = f"P{digit}"
+            row["top_sensor"] = top
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _assign_incidents(
+    incidents: pd.DataFrame, fracs: tuple[float, float, float]
+) -> np.ndarray:
+    """
+    Greedy stratified assignment of incidents to parts 0/1/2.
+
+    Within each stage (largest stage first), incidents are placed largest
+    first into whichever part is furthest below its target share of that
+    stage's incidents, ties broken by the part furthest below its target
+    share of all attack rows, then by train > test > val. A stage with only
+    two incidents therefore lands in train (so supervised models see it)
+    and test (so it is evaluated) rather than wasting one on validation.
+    Deterministic; no random state.
+    """
+    fracs = np.asarray(fracs, dtype=float)
+    total_rows = incidents["attack_rows"].sum()
+    rows_assigned = np.zeros(3)
+    part = np.full(len(incidents), -1)
+
+    stages = incidents.groupby("stage")["attack_rows"].sum().sort_values(ascending=False)
+    for stage in stages.index:
+        idx = incidents.index[incidents["stage"] == stage]
+        idx = incidents.loc[idx].sort_values("attack_rows", ascending=False).index
+        count = np.zeros(3)
+        for i in idx:
+            count_deficit = fracs * len(idx) - count
+            row_deficit = (fracs * total_rows - rows_assigned) / max(total_rows, 1)
+            priority = np.array([0, 2, 1])  # train, then test, then val
+            p = int(np.lexsort((priority, -np.round(row_deficit, 6), -np.round(count_deficit, 6)))[0])
+            part[i] = p
+            count[p] += 1
+            rows_assigned[p] += incidents.loc[i, "attack_rows"]
+    return part
+
+
+def stratified_episode_split(
+    df: pd.DataFrame,
+    label_col: str = "label",
+    name: str = "unnamed",
+    fracs: tuple[float, float, float] = (0.5, 0.25, 0.25),
+    merge_gap: int = 1200,
+    purge: int = 300,
+    scale: bool = True,
+    verbose: bool = True,
+) -> Split:
+    """
+    Attack-coverage split: whole incidents stratified by targeted stage,
+    with purged boundaries. See the section comment above for why and how.
+
+    `fracs` are target shares of incidents (per stage) and of attack rows,
+    not of total rows -- train also receives the whole attack-free prefix,
+    so it is still by far the largest part in rows. `purge` must exceed WINDOW_SIZE and the longest lag,
+    and must be less than half of `merge_gap` so it only ever drops normal
+    rows; both are checked.
+    """
+    if not 0 < 2 * purge < merge_gap:
+        raise ValueError(f"need 0 < 2*purge < merge_gap, got purge={purge}, merge_gap={merge_gap}")
+
+    y = df[label_col].to_numpy().astype(int)
+    inc = attack_incidents(y, df.drop(columns=[label_col]), merge_gap=merge_gap)
+    inc["part"] = _assign_incidents(inc, fracs)
+    return _split_from_assignment(df, inc, label_col, name, merge_gap, purge, scale, verbose)
+
+
+def _split_from_assignment(
+    df: pd.DataFrame,
+    inc: pd.DataFrame,
+    label_col: str,
+    name: str,
+    merge_gap: int,
+    purge: int,
+    scale: bool,
+    verbose: bool,
+) -> Split:
+    """Build a purged, block-aware Split from incidents already tagged with
+    `part` (0 train, 1 val, 2 test). Shared by the single stratified split
+    and every fold of `episode_folds`."""
+    y = df[label_col].to_numpy().astype(int)
+    features = df.drop(columns=[label_col])
+    feature_names = list(features.columns)
+    X = features.to_numpy(dtype=float)
+    n = len(df)
+
+    # block boundaries at the midpoint of each gap between incidents
+    cuts = [0]
+    for k in range(1, len(inc)):
+        cuts.append((inc.loc[k - 1, "end"] + inc.loc[k, "start"]) // 2)
+    cuts.append(n)
+    row_part = np.empty(n, dtype=int)
+    for k in range(len(inc)):
+        row_part[cuts[k] : cuts[k + 1]] = inc.loc[k, "part"]
+
+    # the attack-free prefix belongs to train, whatever incident 0 got
+    row_part[: max(0, inc.loc[0, "start"] - merge_gap // 2)] = 0
+
+    # purge both sides of every boundary between two different parts
+    keep = np.ones(n, dtype=bool)
+    for b in np.flatnonzero(np.diff(row_part)) + 1:
+        lo, hi = max(0, b - purge), min(n, b + purge)
+        assert not y[lo:hi].any(), "purge would drop attack rows; raise merge_gap"
+        keep[lo:hi] = False
+
+    parts, blocks = {}, {}
+    for p, part_name in enumerate(("train", "val", "test")):
+        mask = keep & (row_part == p)
+        idx = np.flatnonzero(mask)
+        parts[part_name] = idx
+        # contiguous stretches of real time inside this part, re-based
+        local = []
+        for s, e in contiguous_runs(mask):
+            offset = np.searchsorted(idx, s)
+            local.append((int(offset), int(offset + (e - s))))
+        blocks[part_name] = local
+
+    X_train, X_val, X_test = (X[parts[k]] for k in ("train", "val", "test"))
+    y_train, y_val, y_test = (y[parts[k]] for k in ("train", "val", "test"))
+
+    if scale:
+        scaler = StandardScaler().fit(X_train)  # train only, deliberately
+        X_train = scaler.transform(X_train)
+        X_val = scaler.transform(X_val)
+        X_test = scaler.transform(X_test)
+
+    split = Split(
+        X_train, y_train, X_val, y_val, X_test, y_test, feature_names, name,
+        blocks=blocks,
+    )
+    _assert_split_valid(split, int(keep.sum()))
+    split.incidents = inc.copy()  # kept for reporting; not part of the dataclass contract
+    split.row_index = parts       # original row of every row in each part, likewise
+
+    if verbose:
+        names = np.array(["train", "val", "test"])
+        tab = pd.crosstab(names[inc["part"]], inc["stage"])
+        print(f"{name}: {len(inc)} incidents, {n - keep.sum():,} rows purged at "
+              f"{(np.diff(row_part) != 0).sum()} boundaries")
+        print(tab.to_string())
+        print()
+    return split
+
+
+# --------------------------------------------------------------------------
+# grouped cross-validation over incidents
+# --------------------------------------------------------------------------
+# One stratified split leaves ~6 incidents in test, and the model ranking
+# flips with which 6 they are (naive_bayes: val PR-AUC 0.46, test 0.04).
+# `episode_folds` rotates instead: incidents are dealt into `n_folds` groups
+# stratified by stage, and fold k uses group k as test, group k+1 as
+# validation, and the rest (plus the attack-free prefix) as train. Every
+# incident is tested exactly once, so every model is scored on every attack
+# and the spread across folds says how much a single-split number can be
+# trusted. Same purging, block bounds and train-only scaling as above.
+
+def _assign_folds(incidents: pd.DataFrame, n_folds: int) -> np.ndarray:
+    """Deal incidents into folds: within each stage (largest stage first),
+    largest incident first, into the fold with the fewest incidents of that
+    stage, ties broken by fewest attack rows overall, then lowest index."""
+    fold = np.full(len(incidents), -1)
+    rows = np.zeros(n_folds)
+    stages = incidents.groupby("stage")["attack_rows"].sum().sort_values(ascending=False)
+    for stage in stages.index:
+        idx = incidents[incidents["stage"] == stage].sort_values("attack_rows", ascending=False).index
+        count = np.zeros(n_folds)
+        for i in idx:
+            f = int(np.lexsort((np.arange(n_folds), rows, count))[0])
+            fold[i] = f
+            count[f] += 1
+            rows[f] += incidents.loc[i, "attack_rows"]
+    return fold
+
+
+def episode_folds(
+    df: pd.DataFrame,
+    n_folds: int = 5,
+    label_col: str = "label",
+    name: str = "unnamed",
+    merge_gap: int = 1200,
+    purge: int = 300,
+    scale: bool = True,
+    verbose: bool = False,
+) -> list[Split]:
+    """Grouped, stage-stratified, purged K-fold over attack incidents.
+    Returns one Split per fold; `split.fold` and `split.incidents` record
+    which incidents went where."""
+    if not 0 < 2 * purge < merge_gap:
+        raise ValueError(f"need 0 < 2*purge < merge_gap, got purge={purge}, merge_gap={merge_gap}")
+    if n_folds < 3:
+        raise ValueError("need n_folds >= 3: one test fold, one validation fold, the rest train")
+
+    y = df[label_col].to_numpy().astype(int)
+    inc = attack_incidents(y, df.drop(columns=[label_col]), merge_gap=merge_gap)
+    inc["fold"] = _assign_folds(inc, n_folds)
+
+    splits = []
+    for k in range(n_folds):
+        inc_k = inc.copy()
+        inc_k["part"] = np.select(
+            [inc_k["fold"] == k, inc_k["fold"] == (k + 1) % n_folds], [2, 1], 0
+        )
+        sp = _split_from_assignment(
+            df, inc_k, label_col, f"{name}-fold{k}", merge_gap, purge, scale, verbose
+        )
+        sp.fold = k
+        splits.append(sp)
+    return splits
 
 
 def _assert_split_valid(split: Split, n_original: int) -> None:
@@ -224,6 +581,30 @@ def make_windows_segmented(
     return np.concatenate(parts)
 
 
+def window_ends(mask: np.ndarray, window: int = 60, stride: int = 1) -> np.ndarray:
+    """
+    Index of the LAST timestep of every window lying wholly inside one
+    contiguous run of True in `mask` -- the same windows
+    `make_windows_segmented` builds, as indices instead of copies.
+
+    Stacking every window up front costs n * window * n_features floats:
+    about 13 GB in float64 for SWaT's ~550k training rows, more than most
+    laptops have. Models gather each batch from these indices instead
+    (`X[ends[:, None] + arange(-window + 1, 1)]`), so memory stays at one
+    copy of X plus one batch.
+    """
+    parts = [
+        np.arange(start + window - 1, end, stride)
+        for start, end in contiguous_runs(mask)
+        if end - start >= window
+    ]
+    if not parts:
+        raise ValueError(
+            f"no contiguous run of masked rows reaches {window} timesteps"
+        )
+    return np.concatenate(parts)
+
+
 def unwindow_scores(
     scores: np.ndarray, n_original: int, window: int = 60, stride: int = 1
 ) -> np.ndarray:
@@ -250,50 +631,6 @@ def unwindow_scores(
 # Each loader returns a time-sorted DataFrame with one `label` column
 # (1 = anomaly) and all other columns numeric features. Do the messy,
 # dataset-specific cleaning HERE so nothing downstream needs special cases.
-
-_HAI_WINDOW_RE = re.compile(
-    r"\[\s*\d+\]\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+"
-    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
-)
-
-
-def _parse_hai_attack_windows(label_path: Path) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
-    """Parse the '[ N]  start  end  duration' rows out of the HAI label
-    summary file. This particular HAI split ships attack windows as a
-    human-readable report, not a per-row label column."""
-    text = Path(label_path).read_text()
-    windows = [
-        (pd.Timestamp(m.group(1)), pd.Timestamp(m.group(2)))
-        for m in _HAI_WINDOW_RE.finditer(text)
-    ]
-    if not windows:
-        raise ValueError(f"no attack windows parsed from {label_path}")
-    return windows
-
-
-def load_hai(
-    data_path: Path | None = None,
-    label_path: Path | None = None,
-) -> pd.DataFrame:
-    """HAI, hai3 test split (2022-08-12 16:00 to 2022-08-13 07:00, 1 Hz).
-
-    `data_path` is a plain timestamp + sensor/actuator CSV with no label
-    column. `label_path` is a report listing attack windows as
-    [index] start_time end_time duration; a row is labelled 1 if its
-    timestamp falls inside any window (inclusive of both ends)."""
-    data_path = data_path or DATA_RAW / "hai" / "hai3_test_220812.csv"
-    label_path = label_path or DATA_RAW / "hai" / "hai3_test_220812_attack_windows.txt"
-
-    df = pd.read_csv(data_path, parse_dates=["timestamp"])
-    df = df.sort_values("timestamp").reset_index(drop=True)
-
-    label = np.zeros(len(df), dtype=int)
-    for start, end in _parse_hai_attack_windows(label_path):
-        label[(df["timestamp"] >= start) & (df["timestamp"] <= end)] = 1
-    df["label"] = label
-
-    return df.drop(columns=["timestamp"])
-
 
 def load_swat(
     normal_path: Path | None = None,
@@ -361,6 +698,252 @@ def load_swat(
     return df
 
 
+# --------------------------------------------------------------------------
+# A1 -> A2 primary protocol: separate streams, nominal-only partitions
+# --------------------------------------------------------------------------
+# The chronological and stratified splits above concatenate the normal and
+# attack files and cut the result, which can put attack-labelled rows in
+# training and validation. That changes the task, and hands attack-label
+# models information a normal-only detector never gets. The primary protocol
+# keeps the two files apart: A1 (nominal) is cut into fit / validation /
+# calibration, in time order, and A2 (attacked) is touched once, for the
+# final test. No A2 row or label is used for scaling, feature choice, early
+# stopping, model selection or thresholds -- asserted, not just documented.
+
+SENSOR_PREFIXES = ("FIT", "LIT", "AIT", "DPIT", "PIT")
+ACTUATOR_PREFIXES = ("MV", "P", "UV")
+
+
+def is_sensor(col: str) -> bool:
+    return col.startswith(SENSOR_PREFIXES)
+
+
+def is_actuator(col: str) -> bool:
+    return not is_sensor(col) and col.startswith(ACTUATOR_PREFIXES)
+
+
+def stage_of(col: str) -> int:
+    """Process stage (1-6) from a SWaT tag, e.g. LIT301 -> 3."""
+    digits = "".join(ch for ch in col if ch.isdigit())
+    return int(digits[0]) if digits else 0
+
+
+def _read_swat_file(path: Path) -> pd.DataFrame:
+    """Read one iTrust SWaT file (xlsx with a title row, or csv export) into
+    a frame with a parsed `timestamp`, numeric features and a 0/1 `label`."""
+    if path.suffix.lower() in (".xlsx", ".xls"):
+        df = pd.read_excel(path, header=1)
+    else:
+        df = pd.read_csv(path)
+    df.columns = [str(c).strip() for c in df.columns]
+    ts_col = next(c for c in df.columns if c.lower() == "timestamp")
+    label_col = next(c for c in df.columns if c.lower() == "normal/attack")
+
+    ts = df[ts_col].astype(str).str.strip()
+    try:
+        ts = pd.to_datetime(ts, format="%d/%m/%Y %I:%M:%S %p")
+    except ValueError:
+        ts = pd.to_datetime(ts, dayfirst=True)
+    # anything that is not "normal" counts as attack: the attack file has
+    # rows labelled "A ttack" (sic)
+    label = df[label_col].astype(str).str.strip().str.lower().str.replace(" ", "", regex=False)
+
+    out = df.drop(columns=[ts_col, label_col]).apply(pd.to_numeric, errors="coerce")
+    out.insert(0, "timestamp", ts.to_numpy())
+    out["label"] = (label != "normal").astype(int).to_numpy()
+    return out
+
+
+def stream_report(df: pd.DataFrame, name: str) -> dict:
+    """Cadence, duplicates, missingness and label counts of one stream --
+    stored with every run so the data version is checkable."""
+    dt = df["timestamp"].diff().dt.total_seconds().iloc[1:]
+    feats = df.drop(columns=["timestamp", "label"])
+    return {
+        "stream": name,
+        "rows": int(len(df)),
+        "start": str(df["timestamp"].iloc[0]),
+        "end": str(df["timestamp"].iloc[-1]),
+        "cadence_s_mode": float(dt.mode().iloc[0]) if len(dt) else None,
+        "gaps_not_1s": int((dt != 1).sum()),
+        "duplicate_timestamps": int(df["timestamp"].duplicated().sum()),
+        "missing_values": int(feats.isna().sum().sum()),
+        "attack_rows": int(df["label"].sum()),
+        "n_features": int(feats.shape[1]),
+    }
+
+
+def load_swat_streams(profile: str = "swat2015", cache: bool = True):
+    """
+    The nominal A1 and attacked A2 streams of SWaT 2015, kept separate,
+    timestamps preserved. Returns (a1, a2, report).
+
+    Parsed frames are cached as pickles under data/processed/ (gitignored,
+    same iTrust terms as data/raw/); delete them to force a re-parse.
+    """
+    from config import DATA_PROCESSED, DATA_PROFILES
+
+    prof = DATA_PROFILES[profile]
+    streams, sources = {}, {}
+    for name, rel, alt in (("A1", prof["normal_file"], None),
+                           ("A2", prof["attack_file"], prof.get("attack_csv"))):
+        # the A2 csv is an export of the same iTrust xlsx, read when present
+        use = alt if alt is not None and (DATA_RAW / alt).exists() else rel
+        sources[name] = use                       # relative to data/raw, recorded below
+        cache_path = DATA_PROCESSED / f"swat2015_{name}_raw.pkl"   # same files for every profile
+        if cache and cache_path.exists():
+            streams[name] = pd.read_pickle(cache_path)
+            continue
+        df = _read_swat_file(DATA_RAW / use)
+        if cache:
+            df.to_pickle(cache_path)
+        streams[name] = df
+
+    a1, a2 = streams["A1"], streams["A2"]
+    raw_a1_rows = len(a1)
+    if prof.get("a1_start"):
+        a1 = a1[a1["timestamp"] >= pd.Timestamp(prof["a1_start"])]
+    a1 = a1.iloc[prof.get("startup_rows", 0):].reset_index(drop=True)
+
+    if a1["label"].any():
+        raise ValueError(f"A1 contains {int(a1['label'].sum())} attack-labelled rows")
+    if a1["timestamp"].iloc[-1] >= a2["timestamp"].iloc[0]:
+        raise ValueError("A1 overlaps A2 in time")
+    for name, df in (("A1", a1), ("A2", a2)):
+        if df.drop(columns=["timestamp", "label"]).isna().any().any():
+            raise ValueError(f"{name} has missing values; decide a policy before running")
+
+    report = {
+        "profile": profile,
+        "A1_raw_rows": int(raw_a1_rows),
+        "A1": {**stream_report(a1, "A1"), "source": sources["A1"]},
+        "A2": {**stream_report(a2, "A2"), "source": sources["A2"]},
+    }
+    return a1, a2, report
+
+
+@dataclass
+class NominalSplit:
+    """A1 fit / validation / calibration plus the held-out A2 test stream.
+
+    Features are already preprocessed by a Preprocessor fit on X_fit only.
+    `y_test` is the A2 row label; nothing upstream of evaluation may read it.
+    """
+
+    X_fit: np.ndarray
+    X_val: np.ndarray
+    X_cal: np.ndarray
+    X_test: np.ndarray
+    y_test: np.ndarray
+    feature_names: list[str]
+    t_test: np.ndarray
+    boundaries: dict
+    preprocessor: "Preprocessor"
+    name: str = "swat-a1a2"
+
+    @property
+    def n_features(self) -> int:
+        return self.X_fit.shape[1]
+
+    def columns(self, kind: str) -> list[int]:
+        """Indices of 'sensor' or 'actuator' columns."""
+        test = is_sensor if kind == "sensor" else is_actuator
+        return [i for i, c in enumerate(self.feature_names) if test(c)]
+
+    def as_split(self) -> Split:
+        """View as a Split with all-normal labels, so the existing
+        unsupervised windowed detectors (lstm_ae, lstm_forecast) train on
+        A1-fit and early-stop on A1-validation unchanged."""
+        return Split(
+            self.X_fit, np.zeros(len(self.X_fit), dtype=int),
+            self.X_val, np.zeros(len(self.X_val), dtype=int),
+            self.X_test, self.y_test, self.feature_names, self.name,
+        )
+
+    def summary(self) -> str:
+        b = self.boundaries
+        lines = [f"{self.name}: {self.n_features} features after preprocessing"]
+        for part in ("fit", "val", "cal", "test"):
+            lines.append(f"  {part:<4} {b[part]['rows']:>8,} rows  {b[part]['start']} -> {b[part]['end']}")
+        lines.append(f"  A2 attack rows {int(self.y_test.sum()):,} ({self.y_test.mean():.4f})")
+        return "\n".join(lines)
+
+
+class Preprocessor:
+    """
+    Every parameter is fit on A1-fit rows and applied unchanged to A1-val,
+    A1-cal and A2: constant-column removal, scaling (standard / min-max /
+    robust), optional winsorisation at fit-row quantiles.
+    """
+
+    def __init__(self, scaler: str = "standard", winsorize=None, **_ignored):
+        self.scaler_name = scaler
+        self.winsorize = winsorize
+
+    def fit(self, X: pd.DataFrame) -> "Preprocessor":
+        from sklearn.preprocessing import MinMaxScaler, RobustScaler
+
+        self.dropped_ = [c for c in X.columns if X[c].nunique() <= 1]
+        self.columns_ = [c for c in X.columns if c not in self.dropped_]
+        Z = X[self.columns_].to_numpy(dtype=float)
+        if self.winsorize:
+            lo, hi = self.winsorize
+            self.clip_ = (np.quantile(Z, lo, axis=0), np.quantile(Z, hi, axis=0))
+            Z = np.clip(Z, *self.clip_)
+        scaler = {"standard": StandardScaler, "minmax": MinMaxScaler,
+                  "robust": RobustScaler}[self.scaler_name]()
+        self.scaler_ = scaler.fit(Z)
+        return self
+
+    def transform(self, X: pd.DataFrame) -> np.ndarray:
+        Z = X[self.columns_].to_numpy(dtype=float)
+        if self.winsorize:
+            Z = np.clip(Z, *self.clip_)
+        return self.scaler_.transform(Z)
+
+    def describe(self) -> dict:
+        return {"scaler": self.scaler_name, "winsorize": self.winsorize,
+                "dropped_constant_in_fit": self.dropped_, "n_kept": len(self.columns_)}
+
+
+def nominal_split(
+    data_profile: str = "swat2015",
+    preprocess: str = "shared",
+    streams=None,
+) -> tuple[NominalSplit, dict]:
+    """Build the primary-protocol split. Returns (split, data report)."""
+    from config import DATA_PROFILES, PREPROCESS_PROFILES
+
+    a1, a2, report = streams if streams is not None else load_swat_streams(data_profile)
+    prof = DATA_PROFILES[data_profile]
+    n = len(a1)
+    i_fit = int(n * prof["fit_frac"])
+    i_val = i_fit + int(n * prof["val_frac"])
+
+    feats = [c for c in a1.columns if c not in ("timestamp", "label")]
+    if list(a2.columns) != list(a1.columns):
+        raise ValueError("A1 and A2 columns differ")
+    parts = {"fit": a1.iloc[:i_fit], "val": a1.iloc[i_fit:i_val],
+             "cal": a1.iloc[i_val:], "test": a2}
+
+    pre = Preprocessor(**PREPROCESS_PROFILES[preprocess]).fit(parts["fit"][feats])
+    X = {k: pre.transform(v[feats]) for k, v in parts.items()}
+    boundaries = {
+        k: {"rows": int(len(v)), "start": str(v["timestamp"].iloc[0]),
+            "end": str(v["timestamp"].iloc[-1])}
+        for k, v in parts.items()
+    }
+    split = NominalSplit(
+        X["fit"], X["val"], X["cal"], X["test"],
+        a2["label"].to_numpy().astype(int), pre.columns_,
+        a2["timestamp"].to_numpy(), boundaries, pre,
+        name=f"{data_profile}-a1a2-{preprocess}",
+    )
+    report = {**report, "preprocess": preprocess, "preprocessor": pre.describe(),
+              "boundaries": boundaries}
+    return split, report
+
+
 def load_wadi() -> pd.DataFrame:
     """WADI A1 Oct 2017. Large, and several columns are entirely NaN.
     Decide the imputation strategy once and record it in notes/datasets.md."""
@@ -379,7 +962,6 @@ def load_batadal() -> pd.DataFrame:
 
 
 LOADERS = {
-    "hai": load_hai,
     "swat": load_swat,
     "wadi": load_wadi,
     "morris": load_morris,
@@ -387,12 +969,20 @@ LOADERS = {
 }
 
 
-def load(name: str, **kwargs) -> Split:
-    """Load a registered dataset and return a chronological split."""
+def load(name: str, protocol: str = "chronological", **kwargs) -> Split:
+    """Load a registered dataset and split it.
+
+    protocol="chronological" (default, deployment-realistic) or
+    "stratified" (episode-stratified, purged; see stratified_episode_split).
+    """
     if name not in LOADERS:
         raise KeyError(f"unknown dataset {name!r}. Available: {list(LOADERS)}")
     df = LOADERS[name](**kwargs)
-    return chronological_split(df, name=name)
+    if protocol == "chronological":
+        return chronological_split(df, name=name)
+    if protocol == "stratified":
+        return stratified_episode_split(df, name=f"{name}-stratified")
+    raise ValueError(f"unknown protocol {protocol!r}")
 
 
 # --------------------------------------------------------------------------

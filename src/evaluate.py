@@ -14,6 +14,17 @@ literature. Kim et al. (AAAI 2022) showed that under point-adjust a RANDOM
 anomaly score can beat published state-of-the-art methods. The gap between the
 two protocols is therefore a result in its own right, not a footnote.
 
+References:
+  Kim et al. (AAAI 2022): S. Kim, K. Choi, H.-S. Choi, B. Lee, and S. Yoon,
+                          "Towards a rigorous evaluation of time-series anomaly
+                          detection," in Proc. AAAI Conf. Artif. Intell., vol.
+                          36, no. 7, 2022, pp. 7194-7201, doi:
+                          10.1609/aaai.v36i7.20680.
+  Heydari & Nyarko (2026): V. Heydari and K. Nyarko, "Alarm-budgeted event-
+                           level evaluation of ICS anomaly detection: Lessons
+                           from SWaT and WADI," IEEE Access, vol. 14, pp.
+                           17585-17609, 2026, doi: 10.1109/ACCESS.2026.3659034.
+
 Usage:
     from evaluate import evaluate_all
     res = evaluate_all(y_true, scores, threshold=t)
@@ -231,3 +242,150 @@ if __name__ == "__main__":
         print("most of the published ICS anomaly detection literature.")
     else:
         print("CHECK: unexpected result, inspect point_adjust().")
+
+
+# --------------------------------------------------------------------------
+# A1 -> A2 primary protocol: alarm events, budgets, event-level metrics
+# --------------------------------------------------------------------------
+# Operators act on alarm EVENTS, not on single flagged seconds. Every model's
+# per-second alarms go through the same `eventize` with the same parameters
+# at calibration (A1) and at test (A2); thresholds are picked on A1 only.
+# Time is measured in rows: both streams are 1 Hz (A2 has a single 82 s
+# timestamp gap, recorded in the data report).
+
+def eventize(
+    alarm: np.ndarray,
+    dilate: int = 0,
+    merge_gap: int = 0,
+    min_duration: int = 1,
+    cooldown: int = 0,
+) -> list[tuple[int, int]]:
+    """
+    Per-second boolean alarms -> [start, end) alarm events:
+      1. dilate every alarmed second by `dilate` seconds on both sides,
+      2. merge runs separated by <= `merge_gap` seconds,
+      3. drop runs shorter than `min_duration` seconds,
+      4. cooldown: an event starting <= `cooldown` s after the previous
+         event's end is folded into it rather than raised as a new alarm.
+    "operator" profile: 2 / 5 / 2 / 10. "min30" profile: 0 / 0 / 30 / 0.
+    """
+    a = np.asarray(alarm, dtype=bool).ravel()
+    n = a.size
+    if dilate > 0 and a.any():
+        idx = np.flatnonzero(a)
+        diff = np.zeros(n + 1, dtype=int)
+        np.add.at(diff, np.clip(idx - dilate, 0, n), 1)
+        np.add.at(diff, np.clip(idx + dilate + 1, 0, n), -1)
+        a = np.cumsum(diff[:n]) > 0
+    runs = find_segments(a.astype(int))
+
+    def _merge(runs, gap):
+        out = []
+        for s, e in runs:
+            if out and s - out[-1][1] <= gap:
+                out[-1] = (out[-1][0], e)
+            else:
+                out.append((s, e))
+        return out
+
+    runs = _merge(runs, merge_gap)
+    runs = [(s, e) for s, e in runs if e - s >= min_duration]
+    return _merge(runs, cooldown) if cooldown > 0 else runs
+
+
+def events_to_mask(events: list[tuple[int, int]], n: int) -> np.ndarray:
+    m = np.zeros(n, dtype=bool)
+    for s, e in events:
+        m[s:e] = True
+    return m
+
+
+def alarm_load(scores: np.ndarray, threshold: float, event_params: dict) -> dict:
+    """Achieved alarm workload of a nominal stream at `threshold`."""
+    ev = eventize(scores >= threshold, **event_params)
+    hours = len(scores) / 3600.0
+    duty = sum(e - s for s, e in ev) / max(len(scores), 1)
+    return {"events": len(ev), "events_per_hour": len(ev) / hours, "duty": duty}
+
+
+def calibrate_budget(
+    cal_scores: np.ndarray,
+    events_per_hour: float,
+    duty_cap: float,
+    event_params: dict,
+) -> tuple[float, dict]:
+    """
+    Alarm-budget calibration (after Heydari & Nyarko 2026) on the nominal
+    calibration stream: the
+    lowest threshold whose eventized alarms stay within `events_per_hour`
+    and `duty_cap`, searched over a quantile grid of the calibration scores.
+
+    Alarm counts are not perfectly monotone in the threshold, so the search
+    walks DOWN from above the maximum and stops at the first violation: the
+    chosen threshold and every grid threshold above it meet the budget,
+    which rules out a lucky isolated low threshold.
+    """
+    s = np.asarray(cal_scores, dtype=float)
+    levels = np.unique(np.concatenate([np.linspace(0.5, 0.99, 50),
+                                       1 - np.logspace(-2, -6.5, 160)]))
+    grid = np.unique(np.quantile(s, levels))[::-1]
+    top = float(s.max()) + 1e-9 * max(1.0, abs(float(s.max())))
+    chosen, load = top, alarm_load(s, top, event_params)
+    for t in grid:
+        l = alarm_load(s, float(t), event_params)
+        if l["events_per_hour"] > events_per_hour or l["duty"] > duty_cap:
+            break
+        chosen, load = float(t), l
+    return chosen, load
+
+
+def attack_event_metrics(
+    y_true: np.ndarray, events: list[tuple[int, int]], n_boot: int = 2000, seed: int = 0
+) -> dict:
+    """
+    Event-level outcome on the attacked stream, one row per annotated attack
+    interval (contiguous run of label 1):
+      detected       any alarm event overlaps the interval
+      delay_s        first alarmed second inside the interval minus its start
+      coverage       fraction of the interval's seconds inside alarm events
+    plus alarm events that overlap no attack interval (false alarm events)
+    and their rate per hour of attack-free A2 time. The miss-rate confidence
+    interval resamples attack INTERVALS (not rows) with replacement.
+    """
+    y = np.asarray(y_true).astype(int)
+    intervals = find_segments(y)
+    mask = events_to_mask(events, len(y))
+    per = []
+    for k, (s, e) in enumerate(intervals):
+        hit = np.flatnonzero(mask[s:e])
+        per.append({"interval": k, "start": s, "length_s": e - s,
+                    "detected": bool(hit.size), "delay_s": int(hit[0]) if hit.size else None,
+                    "coverage": float(mask[s:e].mean())})
+    false_ev = [ev for ev in events if not y[ev[0]:ev[1]].any()]
+    normal_hours = (y == 0).sum() / 3600.0
+    det = np.array([p["detected"] for p in per], dtype=float)
+    rng = np.random.default_rng(seed)
+    boot = det[rng.integers(0, len(det), size=(n_boot, len(det)))].mean(axis=1) if len(det) else np.array([np.nan])
+    delays = [p["delay_s"] for p in per if p["detected"]]
+    return {
+        "n_intervals": len(intervals),
+        "detected": int(det.sum()),
+        "miss_rate": float(1 - det.mean()) if len(det) else float("nan"),
+        "miss_rate_ci95": [float(1 - np.quantile(boot, 0.975)), float(1 - np.quantile(boot, 0.025))],
+        "median_delay_s": float(np.median(delays)) if delays else None,
+        "mean_coverage": float(np.mean([p["coverage"] for p in per])) if per else float("nan"),
+        "alarm_events": len(events),
+        "false_alarm_events": len(false_ev),
+        "false_alarm_events_per_normal_hour": len(false_ev) / normal_hours if normal_hours else float("nan"),
+        "normal_duty": float(mask[y == 0].mean()) if (y == 0).any() else float("nan"),
+        "per_interval": per,
+    }
+
+
+def udr_far_rates(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    """Undetected rate (FN / (FN + TP)) and false alarm rate
+    (FP / (FP + TN)), pointwise."""
+    y, p = np.asarray(y_true).astype(int), np.asarray(y_pred).astype(int)
+    tp, fn = int(((p == 1) & (y == 1)).sum()), int(((p == 0) & (y == 1)).sum())
+    fp, tn = int(((p == 1) & (y == 0)).sum()), int(((p == 0) & (y == 0)).sum())
+    return {"udr": fn / max(fn + tp, 1), "far": fp / max(fp + tn, 1)}
