@@ -251,3 +251,144 @@ def plot_score_distribution(y_true: np.ndarray, scores: np.ndarray, out_path: Pa
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"saved -> {out_path}")
+
+
+# --------------------------------------------------------------------------
+# 7. which attacks land in which part, under each split protocol
+# --------------------------------------------------------------------------
+
+PART_COLOURS = {"train": "#1F6F9C", "val": "#B8721F", "test": "#2F7A4F"}
+
+
+def chronological_incidents(df_raw: pd.DataFrame, split: Split, merge_gap: int = 1200) -> pd.DataFrame:
+    """The incident table for a chronological split, with each incident's
+    part read off the two cut points, so both protocols plot the same way."""
+    from data import attack_incidents
+
+    inc = attack_incidents(
+        df_raw["label"].to_numpy(), df_raw.drop(columns=["label"]), merge_gap=merge_gap
+    )
+    i_train = len(split.y_train)
+    i_val = i_train + len(split.y_val)
+    inc["part"] = np.select([inc["end"] <= i_train, inc["end"] <= i_val], [0, 1], 2)
+    return inc
+
+
+def plot_incident_map(incidents: pd.DataFrame, n_rows: int, out_path: Path, title: str) -> None:
+    """
+    Every attack incident as a bar on the timeline: x = when, width = how
+    long, colour = which part it was assigned to, label = targeted stage.
+    The view that makes a split's attack coverage checkable at a glance --
+    e.g. that the chronological split puts the one 10-hour attack in
+    validation and gives test no stage-1 attack at all.
+    """
+    names = np.array(["train", "val", "test"])
+    first = incidents["start"].min()
+    fig, axes = plt.subplots(2, 1, figsize=(13, 4.5), gridspec_kw={"height_ratios": [3, 2]})
+    ax = axes[0]
+    for _, r in incidents.iterrows():
+        part = names[int(r["part"])]
+        ax.barh(0, (r["end"] - r["start"]) / 3600, left=(r["start"] - first) / 3600,
+                color=PART_COLOURS[part], height=0.6)
+        ax.text((r["start"] - first) / 3600, 0.42, r.get("stage", ""), fontsize=7, rotation=90)
+    ax.set_yticks([])
+    ax.set_xlabel("hours since the first attack")
+    ax.set_title(title)
+    handles = [plt.Rectangle((0, 0), 1, 1, color=c) for c in PART_COLOURS.values()]
+    ax.legend(handles, PART_COLOURS.keys(), loc="upper right", ncol=3, fontsize=8)
+
+    tab = incidents.assign(part=names[incidents["part"].astype(int)])
+    rows = tab.groupby("part").agg(incidents=("incident", "count"), attack_rows=("attack_rows", "sum"))
+    stages = pd.crosstab(tab["part"], tab["stage"]) if "stage" in tab else pd.DataFrame()
+    summary = rows.join(stages).reindex(["train", "val", "test"]).fillna(0).astype(int)
+    axes[1].axis("off")
+    axes[1].table(cellText=summary.values, rowLabels=summary.index,
+                  colLabels=summary.columns, loc="center", cellLoc="center")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"saved -> {out_path}")
+
+
+# --------------------------------------------------------------------------
+# 8. does each sensor's NORMAL behaviour stay put between periods
+# --------------------------------------------------------------------------
+
+def plot_drift(drift: pd.DataFrame, out_path: Path, title: str, top_n: int = 15) -> None:
+    """Bar per sensor: validation-normal mean minus training-normal mean, in
+    training standard deviations (features.drift_report). Bars past +-1 are
+    sensors whose normal operating point moved -- they make unsupervised
+    detectors flag normal rows as attacks."""
+    d = drift.dropna(subset=["val_normal_shift_z"]).head(top_n)
+    fig, ax = plt.subplots(figsize=(7, 5))
+    colours = np.where(d["drifting"], "#A23B3B", "#1F6F9C")
+    ax.barh(d["feature"], d["val_normal_shift_z"], color=colours)
+    for x in (-1, 1):
+        ax.axvline(x, color="#999999", linestyle="--", linewidth=1)
+    ax.invert_yaxis()
+    ax.set_xlabel("normal-row mean shift, val vs train (train std units)")
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"saved -> {out_path}")
+
+
+# --------------------------------------------------------------------------
+# 9. training AND validation loss, so overfitting is visible
+# --------------------------------------------------------------------------
+
+def plot_train_val_loss(name: str, loss: list, val_loss: list, out_path: Path,
+                        best_epoch: int | None = None, val_metric: list | None = None) -> None:
+    """Training loss alone can only show that optimisation works. The gap
+    to the validation curve shows whether it generalises, and the marked
+    best epoch is the one whose weights were kept."""
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(range(len(loss)), loss, marker="o", color="#1F6F9C", label="train")
+    if val_loss:
+        ax.plot(range(len(val_loss)), val_loss, marker="o", color="#B8721F", label="validation")
+    if best_epoch is not None:
+        ax.axvline(best_epoch, color="#2F7A4F", linestyle="--", linewidth=1, label="kept epoch")
+    if val_metric:
+        ax2 = ax.twinx()
+        ax2.plot(range(len(val_metric)), val_metric, color="#A23B3B", linewidth=1, alpha=0.7)
+        ax2.set_ylabel("val PR-AUC", color="#A23B3B")
+        ax2.grid(False)
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("loss")
+    ax.set_title(f"{name}: train vs validation loss")
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"saved -> {out_path}")
+
+
+# --------------------------------------------------------------------------
+# 10. which attacks each model actually catches
+# --------------------------------------------------------------------------
+
+def per_incident_detection(y_true: np.ndarray, scores: np.ndarray, threshold: float,
+                           merge_gap: int = 1200) -> pd.Series:
+    """Fraction of each test incident's attack rows flagged at `threshold`.
+    One number per attack, so "F1 0.4" can be read as "catches these four
+    attacks almost fully and misses the other two entirely" -- or not."""
+    from data import attack_incidents
+
+    inc = attack_incidents(y_true, merge_gap=merge_gap)
+    flagged = scores >= threshold
+    return pd.Series(
+        [flagged[s:e][y_true[s:e] == 1].mean() for s, e in zip(inc["start"], inc["end"])],
+        index=[f"#{k}" for k in inc["incident"]],
+    )
+
+
+def plot_detection_heatmap(table: pd.DataFrame, out_path: Path, title: str) -> None:
+    """Rows = models, columns = test incidents, cell = fraction detected."""
+    fig, ax = plt.subplots(figsize=(1.0 + 0.7 * table.shape[1], 0.45 * table.shape[0] + 1.5))
+    sns.heatmap(table, annot=True, fmt=".2f", vmin=0, vmax=1, cmap="Blues", cbar=False, ax=ax)
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"saved -> {out_path}")
