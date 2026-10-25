@@ -1,7 +1,7 @@
 # UREx CDE2605R — Gradient boosting vs deep learning for ICS anomaly detection
 
-Benchmarking gradient boosting (XGBoost, LightGBM, CatBoost) against deep
-sequence models (LSTM autoencoder) for anomaly detection in Industrial
+Benchmarking Machine Learning against Deep
+sequence models (LSTM autoencoder,forecaster) for anomaly detection in Industrial
 Control Systems, in order to build a decision framework mapping operating
 conditions to an appropriate model family.
 
@@ -254,54 +254,6 @@ cause was a scoring rule structurally blind to the anomalies in question. That
 is the same category of error as evaluating under point-adjust alone, and it
 gets the same treatment: report both, and treat the gap as a finding.
 
----
-
-## Adding a dataset
-
-1. Write a loader in `data.py` returning a time-sorted DataFrame with one
-   `label` column (1 = anomaly) and numeric feature columns. All the messy,
-   dataset-specific cleaning goes here so nothing downstream needs a special
-   case.
-2. Register it in `LOADERS` and add an entry to `DATASET_INFO` in
-   `config.py`.
-3. `python src/experiment.py --dataset <name>`
-
----
-
-## Status
-
-- [x] Evaluation harness, dual protocol, tested
-- [x] Chronological splitting with guardrails
-- [x] XGBoost detector, with optional lag features (`xgboost`, `xgboost_lags`)
-- [x] LSTM autoencoder detector — reconstruction scoring, known blind spot
-- [x] LSTM forecaster detector — prediction scoring, sees temporal structure
-- [x] SWaT loader, validated against the real iTrust download
-- [x] Episode-stratified, purged split protocol alongside the chronological one
-- [x] Pearson feature selection and normal-row drift report (`features.py`)
-- [x] BCE models: logistic regression (lbfgs and Adam), MLP; AdaBoost contrast
-- [x] Validation-tracked training (early stopping, AdamW, OneCycle) for torch models
-- [x] Alarm-budget A1 -> A2 protocol: nominal-only fit/val/calibration, alarm budgets, event metrics
-- [x] Process prediction (actuator -> sensor regression + CUSUM) and unsupervised suite
-- [x] Main pipeline (`baseline.py`): R1 -> R2, 15 label-free models, separate attack-label table
-- [ ] Decide drift handling for the AIT analysers in the alarm-budget protocol (the main pipeline drops them: R2)
-- [ ] Five-seed run of the alarm-budget protocol (`--seeds 5`)
-- [ ] WADI loader (awaiting iTrust)
-- [ ] Morris SCADA loader — the contrast case, load-bearing for the framework
-- [ ] Reproduce the autoencoder numbers of Fung et al. [6] on SWaT before claiming anything
-
----
-
-## Attribution
-
-The SWaT [7], WADI, and BATADAL datasets were provided by iTrust, Centre for
-Research in Cyber Security, Singapore University of Technology and Design.
-
-See `notes/datasets.md` for full terms and the selection rationale.
-
-Method references for the main pipeline's models are in the References section
-of `notebooks/baseline.ipynb`.
-
----
 
 ## References
 
