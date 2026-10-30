@@ -35,6 +35,10 @@ Pipeline:
                       LSTM-forecast (models.lstm_ae / lstm_forecast) on the
                       last 60 s of the min-max columns, fit on the first 80%
                       of TRAIN with early stopping on the last 20%.
+                      Change targets (iteration R3): each process predictor
+                      also predicts a sensor's change over the last w seconds
+                      from the moving actuators' mean states over the same w
+                      seconds (the 1D-CNN: from their last w seconds).
   5. decisions        process prediction: per-sensor control limits on a
                       residual statistic (UCL / LCL = TRAIN extremes); alarm
                       if any sensor is outside. LogisticR and unsupervised:
@@ -49,7 +53,14 @@ Pipeline:
                       sensors by rules decided on the normal file only
                       (R1: mapping R^2 < 0.5; R2: daily normal level drifts by
                       > 10% of range), unsupervised models and LogisticR refit
-                      and thresholds recalibrated for each feature set.
+                      and thresholds recalibrated for each feature set. R3,
+                      also decided on the normal file only, keeps R2's sensors
+                      and adds the w-s change of every sensor whose change the
+                      actuators explain with R^2 >= R1's 0.5; w is the
+                      shortest candidate at which every tank level's change
+                      passes that bar. R3 changes only the process
+                      predictors; LogisticR and the unsupervised models see
+                      R2's sensors, so their R3 rows repeat R2's.
   9. attack labels    SEPARATE protocol and table (run_attack_label): the
                       attack-label classifiers of models.py (xgboost_lags,
                       logistic_regression, cnn_classifier) need attack rows to
@@ -111,6 +122,7 @@ DEFAULTS = {
     # ablation rules, decided on the normal (training) file only
     "mapping_r2_rule": 0.5,               # R1: sensor not explained by its actuators
     "drift_rule": 0.10,                   # R2: daily normal level moves > 10% of its range
+    "change_windows": [30, 60, 90, 120, 180, 300],   # R3: candidate w (s); bar = mapping_r2_rule
     "lags": [1, 5, 30],                   # XGBoost+lags: the lag set of models.xgboost_lags
     "cnn": {"window": WINDOW_SIZE, "filters": 64, "epochs": 15, "batch_size": 256, "lr": 1e-3,
             "train_stride": 5, "patience": 3, "holdout": 0.2},
@@ -258,6 +270,75 @@ def lagged_mapping(mapping: dict, lagged: list[int], n_cols: int, n_lags: int) -
     return {s: {**m, "inputs": list(m["inputs"]) + [n_cols + b * len(lagged) + pos[a]
                                                    for a in m["inputs"] for b in range(blocks)]}
             for s, m in mapping.items()}
+
+
+def rolling_mean(A: np.ndarray, w: int) -> np.ndarray:
+    """Per column, the mean of rows i-w+1 .. i (fewer at the start). Backward-looking only."""
+    c = np.cumsum(np.vstack([np.zeros((1, A.shape[1])), A]), axis=0)
+    end = np.arange(1, len(A) + 1)
+    return (c[end] - c[np.maximum(end - w, 0)]) / np.minimum(end, w)[:, None]
+
+
+def change(A: np.ndarray, w: int) -> np.ndarray:
+    """Per column, x_i - x_{i-w}; 0 for the first w rows."""
+    D = np.zeros_like(A, dtype=float)
+    D[w:] = A[w:] - A[:-w]
+    return D
+
+
+def moving_actuators(X: np.ndarray, columns: list[str]) -> list[int]:
+    """Indices of the actuators that change state in X."""
+    return [i for i, c in enumerate(columns) if is_actuator(c) and np.ptp(X[:, i]) > 0]
+
+
+def change_r2(X: np.ndarray, columns: list[str], w: int) -> pd.Series:
+    """
+    Per sensor, the linear-regression R^2 of its w-s change on the w-s mean
+    states of the actuators that move in X -- R1's measure with the change in
+    place of the level. A tank level integrates in- minus outflow, so the
+    actuators set how fast it changes, not where it is.
+    """
+    from sklearn.linear_model import LinearRegression
+    from sklearn.metrics import r2_score
+
+    sensors = [i for i, c in enumerate(columns) if is_sensor(c)]
+    M = rolling_mean(X[:, moving_actuators(X, columns)], w)[w:]
+    D = change(X[:, sensors], w)[w:]
+    r2 = r2_score(D, LinearRegression().fit(M, D).predict(M), multioutput="raw_values")
+    return pd.Series(r2, index=[columns[i] for i in sensors])
+
+
+def change_window(X: np.ndarray, columns: list[str]) -> tuple[int, pd.DataFrame]:
+    """
+    R3's window w, from TRAIN: the shortest of DEFAULTS["change_windows"] at
+    which every tank level (LIT) has a change the actuators explain with
+    R^2 >= R1's bar. Returns w and change_r2 for every candidate (sensors x w).
+    """
+    table = pd.DataFrame({w: change_r2(X, columns, w) for w in DEFAULTS["change_windows"]})
+    levels = [c for c in table.index if c.startswith("LIT")]
+    ok = [w for w in table.columns if (table.loc[levels, w] >= DEFAULTS["mapping_r2_rule"]).all()]
+    if not ok:
+        raise ValueError(f"no window in {DEFAULTS['change_windows']} explains every level: {levels}")
+    return ok[0], table
+
+
+def change_rule(r2_at_w: pd.Series, excluded: set) -> list[str]:
+    """R3's change targets: every sensor whose change passes R1's bar, except R2's exclusions."""
+    return [s for s, v in r2_at_w.items() if v >= DEFAULTS["mapping_r2_rule"] and s not in excluded]
+
+
+def change_features(X: np.ndarray, columns: list[str], moving: list[int], targets: list[str], w: int):
+    """
+    [X | w-s mean state of each moving actuator | w-s change of each target],
+    the column names, and the mapping of each change target onto the means.
+    Backward-looking only: row i uses rows <= i.
+    """
+    n, m = len(columns), len(moving)
+    A = np.hstack([X, rolling_mean(X[:, moving], w), change(X[:, [columns.index(t) for t in targets]], w)])
+    names = list(columns) + [f"mean{w}s:{columns[a]}" for a in moving] + [f"change{w}s:{t}" for t in targets]
+    mapping = {t: {"target": n + m + k, "inputs": list(range(n, n + m)), "input_names": names[n:n + m]}
+               for k, t in enumerate(targets)}
+    return A, names, mapping
 
 
 # --------------------------------------------------------------------------
@@ -647,13 +728,19 @@ def deep_scorer(name: str, X_train: np.ndarray):
 # --------------------------------------------------------------------------
 
 def metrics(y: np.ndarray, pred: np.ndarray) -> dict:
-    """Pointwise precision, recall, F1, UDR = FN/(FN+TP), FAR = FP/(FP+TN)."""
+    """
+    Pointwise precision, recall, F1, UDR = FN/(FN+TP), FAR = FP/(FP+TN).
+    Event counts alongside: labelled attack intervals with at least one alarm,
+    and false alarm events (runs of consecutive alarms touching no attack row).
+    """
     tp = int(((pred == 1) & (y == 1)).sum()); fn = int(((pred == 0) & (y == 1)).sum())
     fp = int(((pred == 1) & (y == 0)).sum()); tn = int(((pred == 0) & (y == 0)).sum())
     p = tp / max(tp + fp, 1); r = tp / max(tp + fn, 1)
     return {"precision": p, "recall": r, "f1": 2 * p * r / max(p + r, 1e-12),
             "udr": fn / max(fn + tp, 1), "far": fp / max(fp + tn, 1),
-            "tp": tp, "fp": fp, "fn": fn, "tn": tn}
+            "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+            "intervals_detected": int(sum(pred[s:e].any() for s, e in contiguous_runs(y == 1))),
+            "false_alarm_events": sum(1 for s, e in contiguous_runs(pred == 1) if not y[s:e].any())}
 
 
 def _ranked(y, score) -> dict:
@@ -781,12 +868,27 @@ def per_sensor_table(det: ProcessPredictor, columns, Xte, y, mapping, drift, rul
     return t.sort_values("false_alarm_rows", ascending=False)
 
 
+def per_change_table(det: ProcessPredictor, names, Cte, y, r2_at_w: pd.Series) -> pd.DataFrame:
+    """Per change target (R3) of one process predictor, on TEST."""
+    tg = [names[t] for t in det.targets]
+    exc = det.exceedances(Cte)
+    normal = y == 0
+    return pd.DataFrame({
+        "change_r2": [r2_at_w[n.split(":", 1)[1]] for n in tg],
+        "pred_var_ratio": det.pred_var_ratio_,
+        "false_alarm_rows": exc[normal].sum(axis=0),
+        "false_alarm_rate": exc[normal].mean(axis=0),
+        "attack_rows_flagged": exc[~normal].sum(axis=0),
+    }, index=tg).sort_values("false_alarm_rows", ascending=False)
+
+
 # --------------------------------------------------------------------------
 # figures
 # --------------------------------------------------------------------------
 
 C_SUP, C_UNS = "#F7DC6F", "#7DCEA0"                    # yellow, green
-RULE_COLOURS = {"none": "#555555", "R1:": C_SUP, "R2:": C_UNS, "R1 +": "#B8721F"}   # by label prefix
+RULE_COLOURS = {"none": "#555555", "R1:": C_SUP, "R2:": C_UNS, "R1 +": "#B8721F",
+                "R3:": "#5B8FD6"}                                                # by label prefix
 
 
 def fig_scatter(test, prep, path, pca=False, n=6000, seed=42):
@@ -859,8 +961,10 @@ def bar_figures(abl: pd.DataFrame, fig_dir=None):
     read back with index_col=[0, 1] gives the same table), so they can be
     redrawn without rerunning the pipeline."""
     fig_dir = FIG if fig_dir is None else fig_dir
-    r1_label = next(k for k in abl.index.get_level_values(0) if k.startswith("R1:"))
-    r2_label = next(k for k in abl.index.get_level_values(0) if k.startswith("R2:"))
+    labels = list(dict.fromkeys(abl.index.get_level_values(0)))
+    r1_label = next(k for k in labels if k.startswith("R1:"))
+    r2_label = next(k for k in labels if k.startswith("R2:"))
+    r3_label = next((k for k in labels if k.startswith("R3:")), None)
     for metric, title, asc in (("precision", "Precision", False), ("recall", "Recall", False),
                                ("f1", "F1 score", False), ("udr", "Undetected rate (UDR)", True),
                                ("far", "False alarm rate (FAR)", True)):
@@ -869,9 +973,17 @@ def bar_figures(abl: pd.DataFrame, fig_dir=None):
                         f"{title}, sensors the actuators do not explain excluded (R1)", asc)
         fig_metric_bars(abl.loc[r2_label], metric, fig_dir / f"{metric}_R2.png",
                         f"{title}, drifting analysers excluded (R2)", asc)
+        if r3_label:
+            fig_metric_bars(abl.loc[r3_label], metric, fig_dir / f"{metric}_R3.png",
+                            f"{title}, R2 plus change targets (R3)", asc)
     fig_ablation(abl, fig_dir / "ablation_f1_ap.png")
     fig_ablation(abl.loc[[r1_label, r2_label]], fig_dir / "r1_vs_r2_f1_ap.png",
                  "Iteration 1 (R1: mapping R^2 < 0.5) vs iteration 2 (R2: normal-level drift > 10%)")
+    if r3_label:
+        sub = abl.loc[[r2_label, r3_label]]
+        sub = sub[sub.index.get_level_values(1).isin(PROCESS_PREDICTORS)]
+        fig_ablation(sub, fig_dir / "r2_vs_r3_f1_ap.png",
+                     "Iteration 2 (R2) vs iteration 3 (R3: R2 plus change targets), process predictors")
 
 
 # --------------------------------------------------------------------------
@@ -909,12 +1021,24 @@ def run(seed: int = DEFAULTS["seed"], verbose: bool = True) -> dict:
     # file starts one second after the normal file ends, and the features only
     # look back. 1D-CNN input: every actuator that moves in TRAIN.
     act = [i for i, c in enumerate(columns) if is_actuator(c)]
-    moving = [i for i in act if np.ptp(Xtr[:, i]) > 0]
+    moving = moving_actuators(Xtr, columns)
     F = lag_features(np.vstack([Xtr[:, act], Xte[:, act]]))
     Xtr_lag, Xte_lag = np.hstack([Xtr, F[:len(Xtr)]]), np.hstack([Xte, F[len(Xtr):]])
     mapping_lag = lagged_mapping(mapping, act, len(columns), len(DEFAULTS["lags"]))
     mapping_cnn = {s: {**m, "inputs": moving, "input_names": [columns[a] for a in moving]}
                    for s, m in mapping.items()}
+
+    # R3 (normal file only): window and change targets. Change features over
+    # TRAIN then TEST in one pass, like the lags; detectors fit on the TRAIN
+    # rows that have a full window.
+    w, change_table = change_window(Xtr, columns)
+    change_targets = change_rule(change_table[w], rules[r2_label])
+    r3_label = f"R3: R2 + {w}-s change, change R^2 >= {DEFAULTS['mapping_r2_rule']}"
+    C, change_names, mapping_change = change_features(np.vstack([Xtr, Xte]), columns, moving, change_targets, w)
+    Ctr, Cte = C[:len(Xtr)], C[len(Xtr):]
+    mapping_change_cnn = {s: {**m, "inputs": moving} for s, m in mapping_change.items()}
+    log(f"R3 (normal file only): w = {w} s, change targets {change_targets}")
+    per_change = {}
 
     # ---- supervised: process prediction + control limits -----------------
     for name in PROCESS_PREDICTORS:
@@ -936,11 +1060,23 @@ def run(seed: int = DEFAULTS["seed"], verbose: bool = True) -> dict:
             rule_predictions.setdefault(label, {})[name] = pred
             if label == ALL:
                 primary[name] = res
+        # R3: R2's sensors plus the change targets
+        cdet = (CNNPredictor(mapping_change_cnn, seed, {"window": w}) if name == "1D-CNN"
+                else ProcessPredictor(name, mapping_change, seed)).fit(Ctr[w:])
+        cmarg = cdet.margins(Cte)
+        keep = np.array([n not in rules[r2_label] for n in names])
+        score = np.maximum(marg[:, keep].max(axis=1), cmarg.max(axis=1))
+        pred = (score > 0).astype(int)
+        r3 = {**metrics(y, pred), **_ranked(y, score), "n_sensors": int(keep.sum()),
+              "n_change_targets": int(cmarg.shape[1])}
+        ablation.setdefault(r3_label, {})[name] = r3
+        rule_predictions.setdefault(r3_label, {})[name] = pred
+        per_change[name] = per_change_table(cdet, change_names, Cte, y, change_table[w])
         alternative[name] = metrics(y, det.predict(Xs, "accumulating"))
-        records[name] = det.record(columns)
+        records[name] = {**det.record(columns), "change_targets": cdet.record(change_names)}
         per_sensor[name] = per_sensor_table(det, columns, Xs, y, mp, drift, rules)
         log(f"  {name:<17} F1 {primary[name]['f1']:.3f}  AP {primary[name]['ap']:.3f}  "
-            f"FAR {primary[name]['far']:.3%}  ({time.time() - t:.0f}s)")
+            f"FAR {primary[name]['far']:.3%} | R3 F1 {r3['f1']:.3f}  FAR {r3['far']:.3%}  ({time.time() - t:.0f}s)")
 
     # ---- supervised: actuator-state prediction, refit per feature set -----
     S_tr, S_te = train[columns].to_numpy(), test[columns].to_numpy()
@@ -990,6 +1126,12 @@ def run(seed: int = DEFAULTS["seed"], verbose: bool = True) -> dict:
             log(f"  [{label[:2]}] {name:<17} F1 {res['f1']:.3f}  AP {res['ap']:.3f}  "
                 f"FAR {res['far']:.3%}  ({time.time() - t:.0f}s)")
 
+    # R3 changes only the process predictors' targets: LogisticR and the
+    # unsupervised models see R2's sensors, so their R3 rows are R2's.
+    for name in ("LogisticR",) + UNSUPERVISED:
+        ablation[r3_label][name] = ablation[r2_label][name]
+        rule_predictions[r3_label][name] = rule_predictions[r2_label][name]
+
     ours = pd.DataFrame(primary).T
     ours_alt = pd.DataFrame(alternative).T
     abl = pd.concat({k: pd.DataFrame(v).T for k, v in ablation.items()})
@@ -997,13 +1139,13 @@ def run(seed: int = DEFAULTS["seed"], verbose: bool = True) -> dict:
     # ---- per-attack recall -----------------------------------------------
     # With all sensors the supervised detectors alarm on ~76% of normal rows,
     # so per-attack recall is ~1 everywhere and says little; the tables under
-    # R1 and R2 are the informative ones. All three are saved.
+    # R1, R2 and R3 are the informative ones. All four are saved.
     attacks = match_attacks(test, train)
     per_attack = {
         label: pd.DataFrame({m: {a: float(rule_predictions[label][m][r.start:r.end].mean())
                                  for a, r in attacks.iterrows()}
                              for m in SUPERVISED + UNSUPERVISED if m in rule_predictions[label]})
-        for label in (ALL, r1_label, r2_label)
+        for label in (ALL, r1_label, r2_label, r3_label)
     }
 
     # ---- figures ---------------------------------------------------------
@@ -1020,11 +1162,22 @@ def run(seed: int = DEFAULTS["seed"], verbose: bool = True) -> dict:
         "mapping": {k: {kk: v[kk] for kk in ("input_names", "r2", "mse")} for k, v in mapping.items()},
         "nominal_level_drift": drift.to_dict(),
         "exclusion_rules": {k: sorted(v) for k, v in rules.items()},
+        "change_rule": {"label": r3_label, "window_s": w, "candidate_windows_s": DEFAULTS["change_windows"],
+                        "bar": DEFAULTS["mapping_r2_rule"],
+                        "window_rule": "shortest candidate at which every LIT sensor's change passes the bar",
+                        "target_rule": "every sensor whose change passes the bar, except R2's exclusions",
+                        "targets": change_targets,
+                        "inputs": change_names[len(columns):len(columns) + len(moving)],
+                        "change_r2": {str(k): v for k, v in change_table.to_dict().items()},
+                        "applies_to": list(PROCESS_PREDICTORS),
+                        "other_models": "LogisticR and the unsupervised models use R2's sensors; "
+                                        "their R3 rows repeat R2's"},
         "metrics": ours.to_dict(orient="index"),
         "metrics_alternative_reading": ours_alt.to_dict(orient="index"),
         "ablation": {k: pd.DataFrame(v).T.to_dict(orient="index") for k, v in ablation.items()},
         "decision_records": records,
         "per_sensor": {k: v.to_dict(orient="index") for k, v in per_sensor.items()},
+        "per_change_target": {k: v.to_dict(orient="index") for k, v in per_change.items()},
         "attacks": attacks.drop(columns=["evidence"]).to_dict(orient="index"),
         "attack_evidence": attacks["evidence"].to_dict(),
         "per_attack_recall": {k: v.to_dict(orient="index") for k, v in per_attack.items()},
@@ -1039,10 +1192,12 @@ def run(seed: int = DEFAULTS["seed"], verbose: bool = True) -> dict:
     per_attack[ALL].to_csv(OUT / "per_attack_recall.csv")
     per_attack[r1_label].to_csv(OUT / "per_attack_recall_R1.csv")
     per_attack[r2_label].to_csv(OUT / "per_attack_recall_R2.csv")
+    per_attack[r3_label].to_csv(OUT / "per_attack_recall_R3.csv")
+    pd.concat(per_change).to_csv(OUT / "per_change_target.csv")
     log(f"saved -> {OUT}  ({time.time() - t0:.0f}s)")
     return {"metrics": ours, "alternative": ours_alt, "ablation": abl, "per_sensor": per_sensor,
-            "per_attack": per_attack, "attacks": attacks, "audit": audit,
-            "rules": rules, "results": out}
+            "per_change": per_change, "per_attack": per_attack, "attacks": attacks, "audit": audit,
+            "rules": rules, "change_rule": out["change_rule"], "results": out}
 
 
 # --------------------------------------------------------------------------
