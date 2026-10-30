@@ -20,6 +20,8 @@ def test_metrics_definitions():
     assert m["precision"] == 0.75 and m["recall"] == 0.75
     assert m["udr"] == 0.25 and abs(m["far"] - 1 / 6) < 1e-12
     assert abs(m["recall"] + m["udr"] - 1) < 1e-12          # UDR = 1 - recall
+    # alarms 0-2 overlap the attack, alarm 4 is a separate false alarm event
+    assert m["intervals_detected"] == 1 and m["false_alarm_events"] == 1
 
 
 def test_pointwise_statistic_tests_each_sample_on_its_own():
@@ -101,6 +103,53 @@ def test_lagged_mapping_points_at_each_inputs_own_lag_columns():
     # input 3 is the 2nd lagged column: its shift / roll / diff copies sit at
     # n_cols + block * len(lagged) + 1
     assert inp == [3, 4 + 0 * 2 + 1, 4 + 1 * 2 + 1, 4 + 2 * 2 + 1]
+
+
+def test_rolling_mean_and_change_only_look_back():
+    rng = np.random.default_rng(6)
+    A = rng.integers(1, 3, (300, 2)).astype(float)
+    M, D = B.rolling_mean(A, 10), B.change(A, 10)
+    assert np.allclose(M[0], A[0]) and np.allclose(M[20], A[11:21].mean(axis=0))
+    assert np.all(D[:10] == 0) and np.allclose(D[50], A[50] - A[40])
+    A2 = A.copy()
+    A2[200:] = 9.0                                             # change the future only
+    assert np.array_equal(B.rolling_mean(A2, 10)[:200], M[:200])
+    assert np.array_equal(B.change(A2, 10)[:200], D[:200])
+
+
+def _tank(n, noise, seed):
+    """A tank level that integrates inflow (MV101 open) minus outflow (P101 on)."""
+    rng = np.random.default_rng(seed)
+    blocks = rng.integers(40, 160, n // 40)
+    mv = np.repeat(np.arange(len(blocks)) % 2, blocks)[:n] + 1.0         # 1 closed, 2 open
+    p = 3.0 - mv                                                        # pump runs while the valve is closed
+    level = np.cumsum(0.5 * (mv == 2) - 0.5 * (p == 2)) + rng.normal(0, noise, n)
+    return np.column_stack([level, mv, p]), ["LIT101", "MV101", "P101"]
+
+
+def test_change_window_is_the_shortest_that_explains_every_level(monkeypatch):
+    X, cols = _tank(6000, noise=2.0, seed=7)
+    monkeypatch.setitem(B.DEFAULTS, "change_windows", [1, 30, 60])
+    w, table = B.change_window(X, cols)
+    # 1 s: 0.5 units of signal under 2.8 units of differenced noise
+    assert table.loc["LIT101", 1] < 0.5 <= table.loc["LIT101", 30] and w == 30
+    assert B.change_rule(table[w], set()) == ["LIT101"] and B.change_rule(table[w], {"LIT101"}) == []
+
+
+def test_change_target_flags_a_frozen_level():
+    X, cols = _tank(6000, noise=0.5, seed=8)
+    w = 60
+    moving = B.moving_actuators(X, cols)
+    A, names, mapping = B.change_features(X, cols, moving, ["LIT101"], w)
+    det = B.ProcessPredictor("LinearR", mapping, 0).fit(A[w:])
+    assert det.predict(A[w:]).sum() == 0
+    # TEST: the valve held open for 400 s while LIT101 is spoofed at its last value
+    T, _ = _tank(2000, noise=0.5, seed=9)
+    T[1000:1400, 1], T[1000:1400, 2] = 2.0, 1.0
+    T[1000:, 0] = T[999, 0] + np.cumsum(0.5 * (T[1000:, 1] == 2) - 0.5 * (T[1000:, 2] == 2))
+    T[1000:1400, 0] = T[999, 0]
+    At, _, _ = B.change_features(T, cols, moving, ["LIT101"], w)
+    assert det.predict(At)[1000 + w // 4:1400].mean() > 0.9
 
 
 def test_state_predictor_flags_a_state_its_sensors_contradict():

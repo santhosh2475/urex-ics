@@ -17,7 +17,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 python -m pytest tests/ -v          # should be all green
-python src/baseline.py              # MAIN: A1 -> A2, R1 -> R2 iterations, every model (~30 min)
+python src/baseline.py              # MAIN: A1 -> A2, R1 -> R2 -> R3 iterations, every model (~30 min)
 python src/baseline.py --only baseline       # ... the label-free models only (~26 min)
 python src/baseline.py --only attack-label   # ... the attack-label classifiers only (~5 min)
 python src/protocol.py              # A1 -> A2 with alarm budgets and event-level metrics
@@ -32,7 +32,7 @@ notebook and only loads and shows them.
 ## Structure
 
 ```
-src/baseline.py     MAIN pipeline: A1 -> A2, R1 -> R2, label-free models + attack-label table
+src/baseline.py     MAIN pipeline: A1 -> A2, R1 -> R2 -> R3, label-free models + attack-label table
 src/config.py       paths, seeds, split fractions, dataset registry
 src/data.py         loading, chronological splitting, scaling, windowing
 src/models.py       detectors, all behind one interface
@@ -71,7 +71,7 @@ the results record which file each stream was read from.
 
 | objective | models | alarm |
 |---|---|---|
-| process prediction (actuators -> sensors) | LinearR, RF, KNN, XGBoost; XGBoost+lags (1 / 5 / 30 s lags, rolling means, differences); 1D-CNN (last 60 s of every actuator) | any kept sensor's residual statistic outside its control limits (training extremes) |
+| process prediction (actuators -> sensors) | LinearR, RF, KNN, XGBoost; XGBoost+lags (1 / 5 / 30 s lags, rolling means, differences); 1D-CNN (last 60 s of every actuator); under R3 also each sensor's 90 s change | any kept sensor's (or change target's) residual statistic outside its control limits (training extremes) |
 | state prediction (sensors -> actuators) | LogisticR, one per actuator | standardised 1 - P(reported state) above mu + 3 sigma of training scores |
 | unsupervised | iForest, K-Means, Elliptic Envelope, LOF, DBSCAN, One-Class SVM (PCA, 99%); LSTM-AE, LSTM-forecast (60 s windows) | above mu + 3 sigma of training scores |
 
@@ -87,7 +87,23 @@ the results record which file each stream was read from.
 * **R2 results:** XGBoost, RF and LinearR F1 0.81 at 0.2-0.3% false alarms;
   best unsupervised iForest F1 0.75 at 1.4%. LSTM-forecast scores F1 0.53 at
   14.5% false alarms but catches "LIT-101 set to 700" (98%), which no
-  supervised model flags more than 4% of. No model detects "MV-304 closed".
+  supervised model flags more than 4% of. XGBoost alarms in only 12 of the 35
+  labelled attack intervals.
+* **Iteration 3, R3:** keep R2's sensors and add, as further process-prediction
+  targets, each sensor's change over the last 90 s, predicted from the
+  actuators' mean states over those 90 s. A tank level integrates in- minus
+  outflow, so the actuators explain its change, not its level. A sensor gets a
+  change target when the actuators explain its change with R^2 >= 0.5 (R1's
+  bar): 11 sensors, the three tank levels included. 90 s is the shortest
+  window at which every tank level passes. The rule reads only the normal
+  file; the diagnosis (which attacks R2 misses) used the attack file, and
+  five other variants were scored on it and set aside, so the gain is
+  somewhat optimistic. LogisticR and the unsupervised models keep R2's sensors.
+* **R3 results:** XGBoost and XGBoost+lags F1 0.87 (recall 0.82-0.83),
+  alarming in 28 of 35 intervals; LinearR 0.83, RF 0.82, KNN 0.80; the 1D-CNN
+  does not gain (0.79). The cost is false alarms: XGBoost 1.0% (from 0.2%),
+  269 false alarm events against 37. XGBoost now catches "LIT-101 set to 700"
+  (100%). No model flags more than 2% of "MV-304 closed".
 * **Attack-label classifiers** (`xgboost_lags`, `logistic_regression`,
   `cnn_classifier`) need attack rows to train, so they run separately on the
   episode-stratified split: F1 0.002 / 0.32 / 0.19 on held-out incidents. Not
